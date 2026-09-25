@@ -3,7 +3,7 @@
 These are **portable reconstructions of the inference services**, not archived
 competition binaries and not robot controllers. They reuse the released
 `tools/infer_observation.py` model/preprocessing helpers and the existing
-`tools/unfolding_evaluation_ral2025/infer_docker.py` geometry helpers. They do **not**
+`tools/cloth_unfolding/infer_docker.py` geometry helpers. They do **not**
 invoke that historical module's CLI, which expects the removed `config.eval`
 configuration layout.
 

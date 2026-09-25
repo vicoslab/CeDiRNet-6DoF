@@ -50,6 +50,14 @@ def _docker_ignored(path):
 
 
 class ReleaseManifestTests(unittest.TestCase):
+    def test_cloth_unfolding_helpers_use_venue_neutral_package(self):
+        package = ROOT / "tools/cloth_unfolding"
+        self.assertTrue((package / "infer_docker.py").is_file())
+        # The helper package name is a stable public API, not a venue/year label.
+        self.assertFalse(list((ROOT / "tools").glob("*evaluation*")))
+        for name in ("tools/infer_observation.py", "tests/test_resize_compatibility.py"):
+            self.assertIn("from cloth_unfolding.infer_docker import", (ROOT / name).read_text())
+
     def test_docker_copy_model_metadata_is_included(self):
         configs = sorted((ROOT / "models/configs").glob("*.py"))
         self.assertTrue(configs, "Docker needs the released model configs")

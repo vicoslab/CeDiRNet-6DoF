@@ -27,7 +27,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from unfolding_evaluation_ral2025.infer_docker import Inference, load_camera_intrinsics, load_camera_world, FolderServerProcessing  # noqa: E402
+from cloth_unfolding.infer_docker import Inference, load_camera_intrinsics, load_camera_world, FolderServerProcessing  # noqa: E402
 
 VARIANTS: Dict[str, Dict[str, str]] = {
     # Public names: RGB = depth is used only for 3D lifting; RGB-D = depth is also a network input.

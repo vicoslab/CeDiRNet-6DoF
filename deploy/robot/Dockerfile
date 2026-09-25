@@ -1,4 +1,4 @@
-# Modern reconstruction of the RAL 2025 robot-experiment folder adapter.
+# Modern reconstruction of the cloth-unfolding robot-experiment folder adapter.
 # Inference only: no robot/camera drivers or motion commands.
 ARG BASE_IMAGE=cedirnet-6dof:latest
 FROM ${BASE_IMAGE}

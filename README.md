@@ -1,12 +1,36 @@
-# CeDiRNet-6DoF: 6-DoF grasp pose estimation for cloth unfolding
+# Vision-Based 6-DoF Grasp Pose Estimation for Robot Cloth Unfolding
 
-**ICRA 2024 Cloth Competition:** 🥈 This codebase implements the method that participated in the [ICRA 2024 Cloth Competition](https://airo.ugent.be/cloth_competition/), where it achieved **second place**. 🏆
+**CeDiRNet-6DoF · IEEE Transactions on Cybernetics, 2026**
 
-This repository contains the public CeDiRNet-6DoF code used for the paper **Vision-Based 6-DoF Grasp Pose Estimation for Robot Cloth Unfolding**. The paper further formalizes the competition method and evaluates it for robot cloth unfolding. CeDiRNet-6DoF predicts a grasp center and 3D gripper orientation from an RGB observation of a cloth-unfolding scene.
+Domen Tabernik · Peter Nimac · Jan Jerićević · Danijel Skočaj · Andrej Gams
 
-## Method summary
+**[Paper](https://ieeexplore.ieee.org/document/11700396) · [Supplementary video](https://data.vicos.si/skokec/rtfm/CeDiRNet-6DoF/cedirnet_demo_h264_1080p_submission.mp4) · [Pretrained models](#models) · [Dataset](#dataset-setup) · [Citation](#citation)**
 
-The 6-DoF model follows the CeDiRNet center-direction formulation. It uses a ConvNeXt + FPN dense-prediction backbone. A shared dense head predicts center-direction/log-distance/segmentation fields, and three orientation heads predict Euler-axis orientation with sine/cosine-style periodic encoding. Training is fully supervised from annotated 6-DoF grasp poses and uses uncertainty weighting to balance localization, segmentation, and orientation losses.
+CeDiRNet-6DoF predicts where and how to grasp hanging cloth so that a second robot arm can stretch it open. From a single RGB observation, the network localizes grasp candidates and estimates the gripper's full 3D orientation; measured depth and camera calibration complete each 6-DoF pose. This repository provides the paper's learning and inference code, pretrained RGB/RGB-D models, and dataset sidecar masks.
+
+The method achieved **second place at the ICRA 2024 Cloth Competition**. In the paper's subsequent robot evaluation on the competition item set, it achieved **61.3% cloth coverage and 72.5% grasp success**; the full results and protocol distinctions are [below](#reported-robot-results).[1]
+
+## Supplementary video
+
+[![Watch the supplementary video: bimanual robots unfold cloth items of different shapes and materials](assets/supplementary-video.jpg)](https://data.vicos.si/skokec/rtfm/CeDiRNet-6DoF/cedirnet_demo_h264_1080p_submission.mp4)
+
+**▶ [Watch the full supplementary video (MP4)](https://data.vicos.si/skokec/rtfm/CeDiRNet-6DoF/cedirnet_demo_h264_1080p_submission.mp4)** — predicted grasps, intermediate execution states, and unfolded outcomes. Click the image to play the externally hosted video; no video download is included in a clone.
+
+## Method and architecture
+
+![CeDiRNet-6DoF architecture: dense center directions localize grasp points, rotation heads estimate roll, pitch and yaw, and depth completes the 3D grasp position](assets/architecture.png)
+
+1. **Localize a grasp.** A ConvNeXt + FPN backbone predicts dense center-direction fields, and a localization network extracts candidate image points.
+2. **Estimate orientation.** Three parallel heads regress sine/cosine pairs for roll, pitch, and yaw; orientation is read at each detected point.
+3. **Recover the 6-DoF pose.** Sensor depth lifts the image point into 3D, and camera calibration transforms the pose into the world frame.
+
+The shared dense head also predicts log-distance and cloth segmentation as auxiliary training tasks. Fully supervised training uses annotated grasp poses and uncertainty-weighted losses. Joint segmentation, randomized backgrounds, and robot-workspace cropping improve transfer to the robot setup. Figure: author-source architecture from the paper, Figure 1.[1]
+
+![Examples of predicted grasp locations and gripper orientations, with corresponding unfolded cloth outcomes](assets/grasp-results.jpg)
+
+*Predicted grasp poses and corresponding unfolded outcomes from the paper's Figure 4. The supplementary video shows the execution sequences.*[1]
+
+**Getting started:** [Install](#installation) → [prepare data](#dataset-setup) → [run one observation](#one-shot-inference). For learning, see [training and evaluation](#training-and-evaluation); for integration, see [Docker inference](#docker-inference) and [folder-serving deployment](deploy/README.md).
 
 ## Models
 
@@ -259,6 +283,11 @@ If you use this code or the released models, please cite the corresponding paper
   journal = {IEEE Transactions on Cybernetics},
   year    = {2026},
   doi     = {10.1109/TCYB.2026.3732543},
-  note    = {Early access; final pagination pending}
+  url     = {https://ieeexplore.ieee.org/document/11700396},
+  note    = {Early access; final issue pagination pending}
 }
 ```
+
+## Sources
+
+[1] https://ieeexplore.ieee.org/document/11700396 — Vision-Based 6-DoF Grasp Pose Estimation for Robot Cloth Unfolding

@@ -10,7 +10,7 @@ from torchvision.transforms import ToTensor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from unfolding_evaluation_ral2025.infer_docker import Inference
+from cloth_unfolding.infer_docker import Inference
 
 
 class StopAfterInput(Exception):
