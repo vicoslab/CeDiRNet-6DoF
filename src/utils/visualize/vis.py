@@ -29,7 +29,7 @@ class Visualizer:
 
         self.autoadjust_figure_size = autoadjust_figure_size
         if impath2name_fn is None:
-            self.impath2name_fn = lambda name: os.path.splitext(os.path.basename(name))
+            self.impath2name_fn = lambda name: os.path.splitext(os.path.basename(name))[0]
         else:
             self.impath2name_fn = impath2name_fn
 
@@ -255,6 +255,7 @@ class Visualizer:
     def plot_predictions_cv(img, pred_list, pred_poly_mask, pred_match, gt_list, is_difficult_gt,
                             gt=False, bbox=False, predictions_args=dict(), bbox_args=dict()):
         predictions_args_ = dict(markerType=cv2.MARKER_CROSS, markerSize=15, thickness=2)
+        predictions_args_border = dict(markerType=cv2.MARKER_CROSS, markerSize=17, thickness=3)
         predictions_args_.update(predictions_args)
         bbox_args_ = dict(thickness=1)
         bbox_args_.update(bbox_args)
@@ -262,19 +263,21 @@ class Visualizer:
             pred_list_true = pred_list[pred_match[:, 0] > 0, :]
             pred_list_false = pred_list[pred_match[:, 0] <= 0, :]
 
-            for p in pred_list_true: cv2.drawMarker(img, (int(p[0]), int(p[1])), color=(0, 255, 0),
-                                                    **predictions_args_)
-            for p in pred_list_false: cv2.drawMarker(img, (int(p[0]), int(p[1])), color=(0, 0, 255),
-                                                     **predictions_args_)
+            for p in pred_list_true:
+                cv2.drawMarker(img, (int(p[0]), int(p[1])), color=(0, 0, 0), **predictions_args_border) # black border
+                cv2.drawMarker(img, (int(p[0]), int(p[1])), color=(0, 255, 0), **predictions_args_) # green core
+            for p in pred_list_false:
+                cv2.drawMarker(img, (int(p[0]), int(p[1])), color=(0, 0, 0), **predictions_args_border) # black border
+                cv2.drawMarker(img, (int(p[0]), int(p[1])), color=(0, 0, 255), **predictions_args_) # red core
         if gt:
             for i, p in enumerate(gt_list):
-                cv2.circle(img, (int(p[1]), int(p[0])), radius=3,
-                           color=(0, 255, 0) if is_difficult_gt[i] == 0 else (0, 255, 255), thickness=-1)
-                cv2.circle(img, (int(p[1]), int(p[0])), radius=3, color=(0, 0, 0), thickness=1)
+                cv2.circle(img, (int(p[1]), int(p[0])), radius=4,
+                           color=(255, 255, 0) if is_difficult_gt[i] == 0 else (0, 255, 255), thickness=-1)
+                cv2.circle(img, (int(p[1]), int(p[0])), radius=4, color=(0, 0, 0), thickness=1)
         if bbox:
-            poly_true = [np.round(poly[:, [1, 0]]).astype(np.int) for poly, is_correct_ap50, iou in pred_poly_mask
+            poly_true = [np.round(poly[:, [1, 0]]).astype(np.int32) for poly, is_correct_ap50, iou in pred_poly_mask.values()
                          if is_correct_ap50]
-            poly_false = [np.round(poly[:, [1, 0]]).astype(np.int) for poly, is_correct_ap50, iou in pred_poly_mask
+            poly_false = [np.round(poly[:, [1, 0]]).astype(np.int32) for poly, is_correct_ap50, iou in pred_poly_mask.values()
                           if not is_correct_ap50]
             cv2.polylines(img, poly_true, isClosed=True, color=(0, 255, 0), **bbox_args_)
             cv2.polylines(img, poly_false, isClosed=True, color=(0, 0, 255), **bbox_args_)
@@ -290,61 +293,3 @@ class Visualizer:
             for p in pred_list_true: cv2.drawMarker(img, (int(p[0]), int(p[1])), color=(0, 255, 0), **predictions_args_)
             for p in pred_list_false: cv2.drawMarker(img, (int(p[0]), int(p[1])), color=(0, 0, 255), **predictions_args_)
         return img
-
-def show_image(image, is_bgr=True, save_to=None, return_only=False, log=False):
-    """
-    torch.Tensor -> C x H x W
-    cv2 image:   -> H x W x C
-    """
-    if isinstance(image, torch.Tensor):
-        if log:
-            print("Converting torch.Tensor to numpy")
-        image = image.detach().cpu().numpy()
-
-    if len(image.shape) == 4:
-        image = image[0, :, :, :]
-
-    if len(image.shape) == 3:
-        if image.shape[0] <= 3:
-            if log:
-                print("Converting image to channels last")
-            image = np.transpose(image, (1, 2, 0))
-
-        if image.shape[2] == 1:
-            if log:
-                print("Removing dimension from HxWx1 image")
-            image = image[:, :, 0]
-
-    if image.dtype == np.uint8:
-        if log:
-            print("Scaling uint8 image")
-        image = (image / np.max(image) * 255).astype(np.uint8)
-    elif image.dtype == np.bool:
-        if log:
-            print("Converting bool image")
-        image = image * 255
-
-    if save_to is not None:
-        if log:
-            print(f"Saving image to ./{save_to}.png")
-        cv2.imwrite(f"{save_to}.png", image)
-
-    if is_bgr and len(image.shape) == 3:
-        if log:
-            print("Converting to RGB for displaying")
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-    if image.dtype == np.float and np.min(image) < 0 or np.max(image) > 1:
-        if log:
-            print("Scalling image to [0, 1]")
-        image = (image - image.min()) / (image.max() - image.min())
-
-    if return_only:
-        return image
-
-    plt.imshow(image)
-    #plt.show(bbox_inches="tight")
-
-    if log:
-        print("Finished")
-    return image

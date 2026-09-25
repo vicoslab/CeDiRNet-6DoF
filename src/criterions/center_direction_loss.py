@@ -9,6 +9,7 @@ from models.center_groundtruth import CenterDirGroundtruth
 
 from criterions.weightings.unbalanced_weight import UnbalancedWeighting
 from criterions.weightings.instance_weight import InstanceGroupWeighting
+from criterions.weightings.hard_instance_weight import HardInstanceGroupWeighting
 
 from criterions.per_pixel_losses import get_per_pixel_loss_func
 
@@ -17,8 +18,14 @@ from criterions.center_localization_loss import CenterLocalizationLoss
 class CenterDirectionLoss(nn.Module):
 
     def __init__(self, model, num_vector_fields=3,
-                 no_instance_loss=True, enable_centerdir_loss=True,
-                 regression_loss=None, centerdir_instance_weighted=True, loss_weighted_by_distance_gauss=0,
+                 no_instance_loss=True, cls_no_loss=False, enable_centerdir_loss=True, enable_cls_loss=True,
+                 regression_loss=None, cls_loss=None, magnitude_regularization=None,
+                 cls_l1_loss=False, cls_hinge_loss=False, regression_l1_loss=False, regression_hinge_loss=False, regression_hinge_loss_eps=0.0,
+                 cls_instance_weighted=True, centerdir_instance_weighted=True, loss_weighted_by_distance_gauss=0,
+                 use_instance_mask_iou_weight=False, instance_mask_iou_only_fp=False, instance_mask_iou_ignore_tp=False,
+                 instance_mask_iou_include_fn=False,
+                 num_hard_negatives=0, hard_negatives_center_mask=30, hard_negatives_as_single_instance=False,
+                 extend_instance_mask_weights=False, extend_instance_mask_as_hard_negative=False,
                  use_log_r=True, use_log_r_base='exp',
                  learnable_center_est=False, learnable_center_loss='l1',
                  learnable_center_ignore_negative_gradient=False, learnable_center_fp_threshold=0.1,
@@ -33,8 +40,16 @@ class CenterDirectionLoss(nn.Module):
         ################################
         # enable main settings (cls loss, instance loss, localization loss)
         self.no_instance_loss = no_instance_loss                        # False == using only FG for instances, True == use FG and BG
+        self.cls_no_loss = cls_no_loss                                  # no loss for classification
 
         self.enable_centerdir_loss = enable_centerdir_loss
+        self.enable_cls_loss = enable_cls_loss
+
+        if self.enable_cls_loss:
+            self.cls_no_loss = cls_no_loss
+        else:
+            self.cls_no_loss = True
+
         self.localization_criteria = None
         if learnable_center_est:
             self.localization_criteria = CenterLocalizationLoss(loss_type=learnable_center_loss,
@@ -46,13 +61,33 @@ class CenterDirectionLoss(nn.Module):
         ################################
         # equalize importance of pixels from instances: pixels in instances should be considered equally
         # important as bg pixels regardless of thier size
+        self.cls_instance_weighted = cls_instance_weighted              # normalize losses to per-instance case for classification
         self.centerdir_instance_weighted = centerdir_instance_weighted          # normalize losses to per-instance case for regressopm
+
+        ################################
+        # legacy support for loss type
+        if regression_hinge_loss:
+            # use hinge loss with absolute distance within desired eps
+            #self.regression_loss_fn = partial(self.loss_hinge_fn, eps=self.regression_hinge_loss_eps, sign_fn=torch.abs)
+            self.regression_loss = dict(type='hinge', args=dict(eps=regression_hinge_loss_eps, sign_fn=torch.abs))
+        else:
+            self.regression_loss = dict(type='L1' if regression_l1_loss else 'L2')
+
+        if cls_hinge_loss:
+            raise Exception('Hinge loss is not supported for classification any more')
+        elif cls_l1_loss:
+            self.cls_loss = dict(type='L2' if not cls_l1_loss else 'L1')
 
         ################################
         # main losses (cls and regression)
         # new way to define loss using dict(name='NAME',args=...)
         if regression_loss is not None:
             self.regression_loss = regression_loss
+
+        if cls_loss is not None:
+            self.cls_loss = cls_loss
+
+        self.magnitude_regularization = magnitude_regularization        # add regularization by forcing sin^(x)+cos^(x) to zero
 
         self.use_log_r = use_log_r                                      # use logarithm of radii as groundtruth
 
@@ -74,24 +109,65 @@ class CenterDirectionLoss(nn.Module):
         ################################################################
         # Prepare all loss functions
         self.regression_loss_fn = get_per_pixel_loss_func(self.regression_loss)
+        self.cls_loss_fn = get_per_pixel_loss_func(self.cls_loss)
+
+        self.magnitude_regularization_fn = None
+        if self.magnitude_regularization is not None:
+            assert self.magnitude_regularization.lower() in ['l1','l2'], \
+                "invalid magnitude_regularization, only allowed [None, 'L1', 'L2']"
+
+            self.magnitude_regularization_fn = get_per_pixel_loss_func(dict(type=self.magnitude_regularization, Y=1))
+
+        ################################################################
+        # Prepare classes for center estimation
+        self.instance_mask_estimator = getattr(model, 'instance_mask_estimator', None)
+
+        if (extend_instance_mask_weights or use_instance_mask_iou_weight) and self.instance_mask_estimator is None:
+            raise NotImplementedError("instance-mask-based weighting is not supported in the public release")
 
         ################################################################
         # Prepare classes for calculating weight masks
         def get_weighting_op(is_instance_weighted):
             if is_instance_weighted:
-                return InstanceGroupWeighting(border_weight=border_weight, border_weight_px=border_weight_px,
-                                              add_distance_gauss_weight=loss_weighted_by_distance_gauss)
+                if extend_instance_mask_weights or use_instance_mask_iou_weight:
+                    return HardInstanceGroupWeighting(use_instance_mask_iou=use_instance_mask_iou_weight,
+                                                      iou_only_fp=instance_mask_iou_only_fp,
+                                                      iou_ignore_tp=instance_mask_iou_ignore_tp,
+                                                      iou_include_fn=instance_mask_iou_include_fn,
+                                                      num_hard_negatives=num_hard_negatives,
+                                                      hard_negatives_center_mask=hard_negatives_center_mask,
+                                                      hard_negatives_as_single_instance=hard_negatives_as_single_instance,
+                                                      use_extend_instance_mask=extend_instance_mask_weights,
+                                                      extend_instance_mask_as_hard_negative=extend_instance_mask_as_hard_negative,
+                                                      border_weight=border_weight, border_weight_px=border_weight_px,
+                                                      add_distance_gauss_weight=loss_weighted_by_distance_gauss)
+                else:
+                    return InstanceGroupWeighting(border_weight=border_weight, border_weight_px=border_weight_px,
+                                                  add_distance_gauss_weight=loss_weighted_by_distance_gauss)
             else:
                 return UnbalancedWeighting(border_weight=border_weight, border_weight_px=border_weight_px,
                                            add_distance_gauss_weight=loss_weighted_by_distance_gauss)
 
+        self.cls_weighting = get_weighting_op(self.cls_instance_weighted)
         self.dir_weighting = get_weighting_op(self.centerdir_instance_weighted)
 
+        if self.centerdir_instance_weighted == self.cls_instance_weighted and self.cls_no_loss == False:
+            # Since cls and centerdir weights are the same we can re-use weights already computed.
+            # To achieve this, we wrap self.cls_weighting with special function that will store result and return it when
+            # self.dir_weighting is called.
+
+            self.stored_weights = None
+            def store_weights(fn, *args, **kwargs):
+                self.stored_weights = fn(*args, **kwargs)
+                return self.stored_weights
+
+            self.cls_weighting = partial(store_weights,fn=self.cls_weighting)
+            self.dir_weighting = lambda *args, **kwargs: self.stored_weights.clone() if self.stored_weights else self.cls_weighting(*args, **kwargs)
 
         self.tmp = nn.Conv2d(8,8,3)
 
     def forward(self, prediction, sample, centerdir_responses=None, centerdir_gt=None, ignore_mask=None, difficult_mask=None,
-                w_r=1, w_cos=1, w_sin=1, w_fg=1, w_bg=1, w_cent=1, w_fg_cent=1, w_bg_cent=1,
+                w_r=1, w_cos=1, w_sin=1, w_magnitude=1, w_fg=1, w_bg=1, w_cls=1, w_cent=1, w_fg_cent=1, w_bg_cent=1,
                 reduction_dims=(1,2,3), **kwargs):
 
         loss_output_shape = [d for i,d in enumerate(prediction.shape) if i not in reduction_dims]
@@ -112,10 +188,13 @@ class CenterDirectionLoss(nn.Module):
         fg_mask = bg_mask == False
 
         centerdir_vectors = prediction[:, 0:self.num_vector_fields]
+        cls_mask = prediction[:, self.num_vector_fields:]  # 1 x h x w
 
         prediction_sin = centerdir_vectors[:, 0].unsqueeze(1)
         prediction_cos = centerdir_vectors[:, 1].unsqueeze(1)
         prediction_R = centerdir_vectors[:, 2].unsqueeze(1)
+
+        predictions_other = centerdir_vectors[:, 3:]
 
         if instances.dtype != torch.int16:
             instances = instances.type(torch.int16)
@@ -126,8 +205,9 @@ class CenterDirectionLoss(nn.Module):
             instances[ignore_mask.squeeze(dim=1) == 1] = InstanceGroupWeighting.IGNORE_FLAG
 
         # retrieve groundtruth values (either computed or from cache)
-        gt_R, _, gt_sin_th, gt_cos_th,\
-            gt_centers, gt_center_ignore, gt_center_mask, _ = CenterDirGroundtruth.parse_groundtruth(centerdir_gt)
+        gt_R, gt_theta, gt_sin_th, gt_cos_th,\
+            gt_centers, gt_center_ignore, gt_center_mask, \
+            gt_extended_instances = CenterDirGroundtruth.parse_groundtruth(centerdir_gt)
 
         if self.use_log_r:
             gt_R = self.log_r_fn(gt_R)
@@ -137,15 +217,29 @@ class CenterDirectionLoss(nn.Module):
             centers_pred = self._unroll_center_predictions(centers_pred)
         else:
             centers_pred, center_heatmap = None, None
-        
+
+        # function that returns instance mask for each requested center (needed only by HardInstanceGroupWeighting)
+        calc_mask_fn = partial(self._calc_instance_mask, S=prediction_sin, C=prediction_cos, R=prediction_R,
+                               cls=cls_mask, other_features=predictions_other)
+
         # prepare all arguments that are needed for calculating weighting mask
         weighting_args = dict(gt_instances=instances, gt_centers=gt_centers,
-                              predicted_centers=centers_pred,
+                              predicted_centers=centers_pred, calc_mask_fn=calc_mask_fn, gt_extended_instances=gt_extended_instances,
                               gt_ignore=ignore_mask, gt_difficult=difficult_mask, gt_R=gt_R,
                               w_fg=w_fg, w_bg=w_bg)
 
         ######################################################
-        ### centerdir_vectors losses (cos, sin)
+        ### classification loss
+        if self.cls_no_loss == False:
+            with torch.no_grad():
+                # create weighting mask for cls
+                mask_weights = self.cls_weighting(**weighting_args)
+
+            # regress class mask
+            loss_cls += torch.sum(mask_weights * self.cls_loss_fn(cls_mask, labels.type(torch.float32)),dim=reduction_dims)
+
+        ######################################################
+        ### centerdir_vectors losses (R, cos, sin) + any regularization
         if self.enable_centerdir_loss:
             with torch.no_grad():
                 mask_weights = self.dir_weighting(**weighting_args)
@@ -173,16 +267,26 @@ class CenterDirectionLoss(nn.Module):
                     if w_r != 0:
                         loss_r[b] += torch.sum(fg_mask_weights * self.regression_loss_fn(prediction_R[b][fg_mask[b]], gt_R[b][fg_mask[b]]))
 
+            if self.magnitude_regularization_fn is not None and w_magnitude != 0:
+                prediction_M_square = torch.pow(prediction_sin, 2) + torch.pow(prediction_cos, 2)
+
+                loss_magnitude_reg += torch.sum((~ignore_mask).float()*self.magnitude_regularization_fn(prediction_M_square[fg_mask]), dim=reduction_dims) / ((~ignore_mask).sum())
+
         ######################################################
         ###  localization loss for estimating center from centerdir_vectors outputs
         if self.localization_criteria is not None and w_cent != 0:
             loss_centers = self.localization_criteria(centers_pred, center_heatmap, gt_centers, gt_center_mask, ignore_mask,
                                                       w_fg=w_fg_cent, w_bg=w_bg_cent, reduction_dims=reduction_dims)
 
+        loss_cls = w_cls * loss_cls
 
         loss_sin = w_sin * loss_sin
         loss_cos = w_cos * loss_cos
-        loss_r = w_r * loss_r # THIS SHOULD BE ZERO BUT WAS NOT !!!
+        loss_r = w_r * loss_r
+
+        loss_centers = w_cent * loss_centers
+
+        loss_magnitude_reg = w_magnitude * loss_magnitude_reg
 
         loss_centerdir_total = loss_sin + loss_cos + loss_r + loss_magnitude_reg
 
@@ -222,3 +326,26 @@ class CenterDirectionLoss(nn.Module):
                                                        axis=1))
             centers_pred = np.concatenate(centers_pred_res, axis=0)
         return centers_pred
+
+
+    def _calc_instance_mask(self, b, centers, S, C, R, cls, other_features):
+        if self.instance_mask_estimator is None:
+            raise NotImplementedError("instance-mask-based weighting is not supported in the public release")
+
+        output_cls = cls[b]
+        output_cls = (output_cls * (output_cls > 0).float()).squeeze()
+        output_r, output_cos, output_sin = R[b].squeeze(), C[b].squeeze(), S[b].squeeze()
+
+        output_other = other_features[b]
+
+        # convert to pixels-range if needed
+        if self.use_log_r:
+            output_r = self.inverse_log_r_fn(output_r) - 1
+
+        if centers.shape[1] < 3:
+            centers = torch.cat((centers, torch.ones((len(centers), 1), device=centers.device)), dim=1)
+        # get predicted instance mask for groundtruth centers (and hard negatives if included)
+        predicted_mask, _, _ = self.instance_mask_estimator(output_cls, output_r, output_cos, output_sin, centers,
+                                                            output_other, display_projections=False)
+
+        return predicted_mask

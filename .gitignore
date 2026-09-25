@@ -104,4 +104,10 @@ venv.bak/
 .mypy_cache/
 
 # ignore user-specific config for CCC/HPC
-config_user.sh
+.ccc_config_user.sh
+
+# ignore experiment and large data/model artifacts
+exp/
+models/*.pth
+models/upload_to_data_vicos.sh
+dataset/*.zip

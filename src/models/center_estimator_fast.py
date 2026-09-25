@@ -53,5 +53,13 @@ class CenterEstimatorFast(nn.Module):
 
         res, _, times = self.instance_center_estimator(C, S, None, None, None, ignore_region=None)
         center_pred = res
+        #center_pred = np.array(res)
+        # if len(res) > 0:
+        #     idx = np.argsort(center_pred[:, 3])
+        #     center_pred = center_pred[idx[::-1], :]
 
+        # res = (batch, x,y, center_score)
         return center_pred, times
+        #center_pred = torch.tensor(center_pred).to(input.device)
+
+        #return dict(center_pred=center_pred)

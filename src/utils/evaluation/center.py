@@ -20,7 +20,7 @@ class CenterEvaluation:
     def save_attributes(self):
         return dict(tau=self.tau_thr, d_alpha=self.merge_threshold_px, score_thr=self.score_thr)
 
-    def add_image_prediction(self, im_name, im_index, im_shape, predictions, predictions_score,
+    def add_image_prediction(self, sample, im_name, im_index, im_shape, predictions_data,
                              gt_instances_ids, gt_centers_dict, gt_difficult, centerdir_gt, **kwargs):
         gt_centers = [gt_centers_dict[k] for k in sorted(gt_centers_dict.keys())]
         gt_centers = np.array(gt_centers)
@@ -29,13 +29,21 @@ class CenterEvaluation:
         pred_missed = False
 
         pred_gt_match = []
+        pred_centers = predictions_data['center']
+        pred_score = predictions_data['score']
+        pred_ids = sorted(pred_centers.keys())
+
+        if len(pred_ids) > 0:
+            predictions, predictions_score = map(np.array, zip(*[(pred_centers[id], pred_score[id]) for id in pred_ids]))
+        else:
+            predictions, predictions_score = [], []
 
         if len(predictions) > 0:
 
             pred_gt_center = []
             # TODO: this should be tested for any errors !!!
             # convert predictions from 2d to 1d index and use it to find corresponding GT ids
-            for pred_id in np.ravel_multi_index(np.array([[pred[1],pred[0]] for pred in predictions])):
+            for pred_id in np.ravel_multi_index(np.array([[pred[1],pred[0]] for pred in pred_centers.values()])):
                 gt_cent = np.array([0,0]) # by default
                 for index,ids in gt_instances_ids.items():
                     if np.any(ids == pred_id):
@@ -55,7 +63,7 @@ class CenterEvaluation:
 
             # match predictions with groundtruth
             pred_gt_match = np.zeros(shape=(pred_list.shape[0], 1))
-            remaining_pred = np.ones(len(predictions), dtype=np.float32)
+            remaining_pred = np.ones(len(pred_centers), dtype=np.float32)
 
             for gt_center in gt_centers:
                 center_distance = [np.sqrt(np.sum(np.power(np.array([pred[1], pred[0]]) - gt_center, 2))) for pred in

@@ -1,0 +1,31 @@
+{
+  "crop_rgb": {
+    "variant": "crop_rgb",
+    "checkpoint": "models/cedirnet6dof_crop_rgb.pth",
+    "config": "models/configs/cedirnet6dof_crop_rgb.py",
+    "url": "https://data.vicos.si/skokec/rtfm/CeDiRNet-6DoF/cedirnet6dof_crop_rgb.pth",
+    "sha256": "7b64a65fd1fc8ea6f576f316213327b389ca1be142f61cc0d106f9e9c6302f75",
+    "size_bytes": 1082935856
+  },
+  "nocrop_rgb": {
+    "variant": "nocrop_rgb",
+    "checkpoint": "models/cedirnet6dof_nocrop_rgb.pth",
+    "config": "models/configs/cedirnet6dof_nocrop_rgb.py",
+    "url": "https://data.vicos.si/skokec/rtfm/CeDiRNet-6DoF/cedirnet6dof_nocrop_rgb.pth",
+    "sha256": "9c2e625e276fe9b023a39a0f19146b804c9aafb54863a76a3c032b9c868d4034",
+    "size_bytes": 1082935856
+  },
+  "crop_rgbd": {
+    "variant": "crop_rgbd",
+    "checkpoint": "models/cedirnet6dof_crop_rgbd.pth",
+    "config": "models/configs/cedirnet6dof_crop_rgbd.py",
+    "url": "https://data.vicos.si/skokec/rtfm/CeDiRNet-6DoF/cedirnet6dof_crop_rgbd.pth",
+    "sha256": "3d09ca38a3b6efc8833d34a07a4906230c61853f06ccfb9154824d89b41a6b83",
+    "size_bytes": 1082960432
+  },
+  "dataset_fixes": {
+    "url": "https://data.vicos.si/skokec/rtfm/CeDiRNet-6DoF/icra2024_dataset_fixes.zip",
+    "sha256": "b6dd0a967d1df0749119d7d92e9e874d0968cce353afa12a675f1cc5ab3877e3",
+    "size_files": 503
+  }
+}

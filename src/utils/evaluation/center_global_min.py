@@ -14,6 +14,7 @@ class CenterGlobalMinimizationEval:
     def __init__(self, exp_name='', exp_attributes=None, score_thr=0, tau_thr=30, center_ap_eval=None, display_best_threshold=False, append_count_to_display_name=True):
         self.exp_name = exp_name
         self.exp_attributes = exp_attributes
+        self.score_thr = score_thr
         self.tau_thr = tau_thr # max distance from grroundtruth that is still allowed to consider as true-positive
         self.metrics = dict(precision=[],recall=[],F1=[],ratio=[],TP=[],FP=[],FN=[],N=[],P=[],Re=[],mae=[],rmse=[])
         self.center_ap_eval = center_ap_eval
@@ -23,15 +24,10 @@ class CenterGlobalMinimizationEval:
         self.append_count_to_display_name = append_count_to_display_name
 
     def save_str(self):
-        ret = "tau=%.1f" % self.tau_thr
-        
-        if self.center_ap_eval is not None:
-            ret = f"{ret}-center_ap_eval={str(self.center_ap_eval)}"
-        
-        return ret
+        return "tau=%.1f-score_thr=%.1f-center_ap_eval=%s" % (self.tau_thr, self.score_thr, str(self.center_ap_eval))
 
     def get_attributes(self):
-        attrs = dict(tau=self.tau_thr)
+        attrs = dict(tau=self.tau_thr, score_thr=self.score_thr)
         if self.exp_attributes is not None:
             attrs.update(self.exp_attributes)
         return attrs
@@ -64,7 +60,7 @@ class CenterGlobalMinimizationEval:
         valid_predictions = np.where(cost_matrix[pred_ind, gt_ind] < self.tau_thr)[0]
         return pred_ind[valid_predictions], gt_ind[valid_predictions]
 
-    def add_image_prediction(self, im_name, im_index, im_shape, predictions, predictions_score,
+    def add_image_prediction(self, sample, im_name, im_index, im_shape, predictions_data,
                              gt_instances_ids, gt_centers_dict, gt_difficult, centerdir_gt, return_matched_gt_idx=False):
 
         gt_centers = [gt_centers_dict[k] for k in sorted(gt_centers_dict.keys())]
@@ -72,6 +68,15 @@ class CenterGlobalMinimizationEval:
 
         pred_gt_match = np.array([])
         pred_gt_match_idx = np.array([])
+
+        pred_centers = predictions_data['center']
+        pred_score = predictions_data['score']
+        pred_ids = sorted(pred_centers.keys())
+
+        if len(pred_ids) > 0:
+            predictions, predictions_score = map(np.array, zip(*[(pred_centers[id], pred_score[id]) for id in pred_ids]))
+        else:
+            predictions, predictions_score = [], []
 
         if len(predictions) > 0:
             pred_gt_match = np.zeros(shape=(predictions.shape[0], 1))

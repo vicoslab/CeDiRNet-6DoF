@@ -1,24 +1,97 @@
 import os
-
+from functools import partial
 import numpy as np
 import sys
 import torch
 from torch import nn as nn
+import torch.nn.functional as F
 
 from utils.utils import GaussianLayer
 
+from utils.utils import variable_len_collate
+
+def make_generic_regression_map(gt_map, out_key, id_x, id_y, out_id, dev):
+    out = torch.zeros(size=gt_map.shape, dtype=torch.float, device=dev, requires_grad=False)
+    out[:, out_id[:,0], out_id[:,1]] = gt_map[:, id_x, id_y]
+
+    # this is for compatability with the older implementation where output must be [batch,N,1,W,H] (batch is added later)
+    if len(out.shape) < 4:
+        out = out.unsqueeze(1)
+
+    return {out_key:out}
+
+def make_orientation_map(orientation, key, id_x, id_y, out_id, dev, orientation_type):
+
+    ROT_DIMS, height, width = orientation.shape
+
+    # orientation may hold confidence score at the end as well
+    has_confidence_score = ROT_DIMS == 2 or ROT_DIMS == 4
+    if has_confidence_score:
+        ROT_DIMS -= 1
+
+    assert ROT_DIMS > 0 and ROT_DIMS < 4
+
+    angle = orientation[0:ROT_DIMS, id_x, id_y]
+
+    maps = dict()
+    if orientation_type.lower() in ['euler','axis']:
+        # reparametrize 3D using sin/cos for Euler or axis-aligned angles
+        maps['gt_orientation_sin'] = torch.zeros(size=[ROT_DIMS, 1, height, width], dtype=torch.float, device=dev, requires_grad=False)
+        maps['gt_orientation_cos'] = torch.zeros(size=[ROT_DIMS, 1, height, width], dtype=torch.float, device=dev, requires_grad=False)
+
+        maps['gt_orientation_sin'][:, 0, out_id[:,0], out_id[:,1]] = torch.sin(angle)
+        maps['gt_orientation_cos'][:, 0, out_id[:,0], out_id[:,1]] = torch.cos(angle)
+
+    elif orientation_type.lower() in ['quaternion']:
+        assert ROT_DIMS == 3, "Input error: quaternion can only be computed from 3D angle"
+
+        # convert orientation from euler into quaternion
+        from utils.utils_3d import euler_to_quaternion_matrix
+
+        maps['gt_orientation_quaternion'] = torch.zeros(size=[4, 1, height, width], dtype=torch.float, device=dev, requires_grad=False)
+        maps['gt_orientation_quaternion'][:, 0, out_id[:,0], out_id[:,1]] = euler_to_quaternion_matrix(angle)
+
+    elif orientation_type.lower() in ['3d-so(3)']:
+        raise Exception("Not implemneted yet")
+    else:
+        raise Exception("Unknown orientation representation type")
+
+    if has_confidence_score:
+        maps['gt_confidence_score'] = torch.zeros(size=[1, 1, height, width], dtype=torch.float, device=dev, requires_grad=False)
+        maps['gt_confidence_score'][0, 0, out_id[:,0], out_id[:,1]] = orientation[-1, id_x, id_y]
+
+    return maps
+
 
 class CenterDirGroundtruth(nn.Module):
-    def __init__(self, MAX_NUM_CENTERS=100, ignore_instance_mask_and_use_closest_center=False,
-                 center_ignore_px=3, center_gt_blur=2, skip_gt_center_mask_generate=False):
+    def __init__(self, centerdir_gt_cache=None, extend_instance_mask_weights=0, MAX_NUM_CENTERS=100,
+                 backbone_output_cache=None, load_cached_backbone_output_probability=0,
+                 use_cached_backbone_output=False, save_cached_backbone_output_only=False,
+                 add_synthetic_output=False, ignore_instance_mask_and_use_closest_center=False,
+                 center_ignore_px=3, center_gt_blur=2, skip_gt_center_mask_generate=False, orientation_type='euler',
+                 generic_regression_maps=[]):
         super().__init__()
 
+        self.centerdir_gt_cache = centerdir_gt_cache
+
+        self.backbone_output_cache = backbone_output_cache
+        self.load_cached_backbone_output_probability = load_cached_backbone_output_probability
+        self.use_cached_backbone_output = use_cached_backbone_output
+        self.save_cached_backbone_output_only = save_cached_backbone_output_only
+
+        self.add_synthetic_output = add_synthetic_output
+
         self.ignore_instance_mask_and_use_closest_center = ignore_instance_mask_and_use_closest_center
-        
+        self.extend_instance_mask_weights = extend_instance_mask_weights
+
         self.MAX_NUM_CENTERS = MAX_NUM_CENTERS
 
         self.center_ignore_px = center_ignore_px
         self.skip_gt_center_mask_generate = skip_gt_center_mask_generate
+
+        self.custom_regression_maps = {tuple(key): make_generic_regression_map for key in generic_regression_maps}
+        self.custom_regression_maps['orientation'] = partial(make_orientation_map, orientation_type=orientation_type)
+
         ################################################################
         # Prepare location/coordinate map
         xym = self._create_xym(0)
@@ -27,6 +100,9 @@ class CenterDirGroundtruth(nn.Module):
 
         with torch.no_grad():
             self.gaussian_blur = GaussianLayer(num_channels=1, sigma=center_gt_blur)
+
+        if self.centerdir_gt_cache is not None and os.path.exists(self.centerdir_gt_cache) is False:
+            os.makedirs(self.centerdir_gt_cache)
 
     def _create_xym(self, size):
         # coordinate map
@@ -47,200 +123,230 @@ class CenterDirGroundtruth(nn.Module):
         return self.xym[:, 0:height, 0:width].contiguous()  # 2 x h x w
 
     def forward(self, sample, batch_index):
-        instances = sample['instance']
-        label = sample['label']
-        sample_name = sample['im_name']
+        # generate groundtruth maps for each sample in batch
+        with torch.no_grad():
+            batch_size, _, height, width = sample['instance'].shape
 
-        centers = sample.get('center')
-        centerdir_gt = sample.get('centerdir_groundtruth')
-        output = sample.get('output')
-        orientation = sample.get('orientation')
+            xym_s = self._get_xym(height, width)
 
-        # generate any missing groundtruth and store it
-        centerdir_gt = self._generate_and_store_groundtruth(centerdir_gt, instances, centers, sample_name, batch_index, orientation)
+            centerdir_gt = []
+            for b in range(batch_size):
+                centerdir_gt_b = dict(height=height, width=width)
+
+                # first generate gt_centers list, instance mask, and an associated center pos for every pixel
+                gt_centers, (gt_center_x, gt_center_y), valid_instance_mask = self._get_centers_and_instance_masks(sample, b, batch_index, xym_s)
+
+                # add list of centers
+                centerdir_gt_b['gt_centers'] = gt_centers
+
+                # append maps for center direction
+                centerdir_gt_b.update(self._generate_center_directions(sample, b, gt_centers, gt_center_x, gt_center_y, valid_instance_mask, xym_s))
+
+                # append maps for orientation
+                centerdir_gt_b.update(self._generate_custom_regression_map(sample, b, gt_centers, gt_center_x, gt_center_y, valid_instance_mask, xym_s))
+
+                # append maps for extented instances
+                centerdir_gt_b.update(self._generate_extented_instance_mask(sample, b, gt_centers, gt_center_x, gt_center_y, valid_instance_mask, xym_s))
+
+                centerdir_gt.append(centerdir_gt_b)
+
+            # convert from a list of dict to a dict of tensors with first dimension as batch index
+            centerdir_gt = variable_len_collate(centerdir_gt)
 
         if 'instance_polygon' in sample:
-            instance_polygon = sample['instance_polygon']
-            centerdir_gt.append(instance_polygon)
+            centerdir_gt['instance_polygon'] = sample['instance_polygon']
+
+        if 'image_px_in_nm' in sample:
+            centerdir_gt['image_px_in_nm'] = sample['image_px_in_nm']
+
+        # also create synthetic output if does not exist yet
+        if self.add_synthetic_output:
+            output = sample.get('output')
+            label = sample.get('label')
+            if output is None:
+                output = self._create_synthetic_output(centerdir_gt, label)
+
+            sample['output'] = output
 
         # attach centerdir groundtruh and output values to returned sample
         sample['centerdir_groundtruth'] = centerdir_gt
 
         return sample
 
-    def _generate_and_store_groundtruth(self, centerdir_gt, instances, centers, sample_name, sample_name_idx, orientation):
-        with torch.no_grad():
-            batch_size, _, height, width = instances.shape
+    def _get_centers_and_instance_masks(self, sample, b, batch_index, xym_s):
+        instances = sample['instance'][b,0]
+        sample_name = sample['im_name'][batch_index[b].item()]
+        centers = sample['center'][b]
 
-            # remove single dimensions
-            instances = instances[:,0]
+        instance_ids_b = instances.unique()
 
-            xym_s = self._get_xym(height, width)
+        gt_centers = torch.zeros(size=(self.MAX_NUM_CENTERS, 2), dtype=torch.float, device=xym_s.device)
 
-            if centerdir_gt is None:
-                centerdir_gt = []
+        gt_center_x, gt_center_y = None, None
 
-            if len(centerdir_gt) < 5:
-                centerdir_gt_matrix = torch.zeros(size=[batch_size, 13, 1, height, width], dtype=torch.float, device=xym_s.device, requires_grad=False)
-                centerdir_gt_present = [0]*batch_size
+        # version that assigns closest distance to each pixel and computes results for the whole image at once
+        if self.ignore_instance_mask_and_use_closest_center:
+            # requires list of centers first
+            assert centers is not None
 
-                extended_instances_num = [0]*batch_size
-                extended_instances = torch.zeros([batch_size, height, width], dtype=torch.int16, device=xym_s.device, requires_grad=False)
+            # list of all centers valid for this batch
+            valid_centers = (centers[:,0] > 0) | (centers[:,1] > 0)
+            gt_centers[valid_centers,:] = (centers[valid_centers][:,[1,0]]).float()
 
-                if centers is None:
-                    centers_ = torch.zeros(size=[batch_size, self.MAX_NUM_CENTERS, 2], dtype=torch.float, device=xym_s.device, requires_grad=False)
-                else:
-                    centers_ = centers
+            # skip if no centers
+            if valid_centers.sum() > 0:
+                assigned_center_ids = CenterDirGroundtruth.find_closest_center(centers, instances, xym_s)
 
-                centerdir_gt.extend([centerdir_gt_matrix, centerdir_gt_present, centers_, extended_instances_num, extended_instances])
+                # per-pixel center locations
+                gt_center_x = centers[assigned_center_ids[:], 1].unsqueeze(0)
+                gt_center_y = centers[assigned_center_ids[:], 0].unsqueeze(0)
 
-            if centers is not None:
-                assert centerdir_gt[2].shape[1] == centers.shape[1], "ERROR: Different number of MAX_NUM_CENTERS detected!! Use the same value in all settings"
+            # all pixels are considered as instance mask since we may not have valid instance mask at all
+            instance_mask = torch.ones_like(instances.unsqueeze(0), dtype=torch.bool)
+        else:
+            # assign centers based on instance map (if there are any centers)
 
-            # centerdir losses
-            for b in range(batch_size):
-                update_centerdir_vals = not centerdir_gt[1][b]
+            if len(instance_ids_b) > 1:
+                gt_center_x = torch.ones_like(instances.unsqueeze(0), dtype=torch.float) * -10000
+                gt_center_y = torch.ones_like(instances.unsqueeze(0), dtype=torch.float) * -10000
 
-                if update_centerdir_vals:
+                for id in instance_ids_b:
+                    if id <= 0: continue
+                    if id > len(centers):
+                        print("ERROR: GOT OUT OF BOUNDS INDEX:  %d for img: " % id, sample_name)
+                        sys.stdout.flush()
+                        continue
 
-                    gt_center_ignore = torch.ones_like(instances[b:b+1], dtype=torch.uint8, device=xym_s.device)
-                    # we need separate buffer for gt_center_mask if center_ignore_px is zero since we will not
-                    # have any GT values otherwise
-                    if self.center_ignore_px <= 0:
-                        gt_center_mask = torch.ones_like(instances[b:b + 1], dtype=torch.uint8, device=xym_s.device)
+                    in_mask = instances.eq(id).unsqueeze(0)
+
+                    if centers is None:
+                        # calculate center of attraction
+                        xy_in = xym_s[in_mask.expand_as(xym_s)].view(2, -1)
+                        center = xy_in.mean(1).view(2, 1, 1)  # 2 x 1 x 1
                     else:
-                        # just reuse gt_center_ignore
-                        gt_center_mask = gt_center_ignore
+                        center = centers[id.item()-1,:]
 
-                    gt_centers = torch.zeros(size=(self.MAX_NUM_CENTERS, 2), dtype=torch.float, device=xym_s.device)
+                    gt_centers[id.item()] = center.squeeze()[[1, 0]]
 
-                    instance_ids_b = instances[b].unique()
+                    gt_center_x[in_mask] = center[1].float()
+                    gt_center_y[in_mask] = center[0].float()
 
-                    gt_center_x, gt_center_y = None, None
+                instance_mask = instances.unsqueeze(0) > 0
 
-                    # version that assigns closest distance to each pixel and computes results for the whole image at once
-                    if self.ignore_instance_mask_and_use_closest_center:
-                        # requires list of centers first
-                        assert centers is not None
+        return gt_centers, (gt_center_x, gt_center_y), instance_mask
 
-                        # list of all centers valid for this batch
-                        valid_centers = (centers[b,:,0] > 0) | (centers[b,:,1] > 0)
-                        gt_centers[valid_centers,:] = (centers[b][valid_centers][:,[1,0]]).float()
+    def _generate_center_directions(self, sample, b, gt_centers, gt_center_x, gt_center_y, instance_mask, xym_s):
+        instances = sample['instance'][:,0]
 
-                        # skip if no centers
-                        if valid_centers.sum() > 0:
-                            assigned_center_ids = CenterDirGroundtruth.find_closest_center(centers[b], instances[b], xym_s)
+        centerdir_gt_b = {}
 
-                            # per-pixel center locations
-                            gt_center_x = centers[b,assigned_center_ids[:], 1].unsqueeze(0)
-                            gt_center_y = centers[b,assigned_center_ids[:], 0].unsqueeze(0)
+        gt_center_ignore = torch.ones_like(instances[b:b+1], dtype=torch.uint8, device=xym_s.device)
+        # we need separate buffer for gt_center_mask if center_ignore_px is zero since we will not
+        # have any GT values otherwise (just reuse gt_center_ignore if self.center_ignore_px > 0 )
+        gt_center_mask = torch.ones_like(instances[b:b + 1], dtype=torch.uint8, device=xym_s.device) if self.center_ignore_px <= 0 else gt_center_ignore
 
-                        # all pixels are considered as instance mask since we may not have valid instance mask at all
-                        instance_mask = torch.ones_like(instances[b].unsqueeze(0), dtype=torch.bool)
-                    else:
-                        # assign centers based on instance map (if there are any centers)
+        # do nothing if no centers
+        if gt_center_x is not None and gt_center_y is not None:
 
-                        if len(instance_ids_b) > 1:
-                            gt_center_x = torch.ones_like(instances[b].unsqueeze(0), dtype=torch.float) * -10000
-                            gt_center_y = torch.ones_like(instances[b].unsqueeze(0), dtype=torch.float) * -10000
+            gt_X = gt_center_x - xym_s[1].unsqueeze(0)
+            gt_Y = gt_center_y - xym_s[0].unsqueeze(0)
 
-                            for id in instance_ids_b:
-                                if id <= 0: continue
-                                if id > len(centers[b]):
-                                    print("ERROR: GOT OUT OF BOUNDS INDEX:  %d for img: " % id, sample_name[sample_name_idx[b].item()])
-                                    sys.stdout.flush()
-                                    continue
+            if self.center_ignore_px <= 0:
+                # just set gt_center_mask with default distance vals but not gt_center_ignore
+                if not self.skip_gt_center_mask_generate:
+                    gt_center_mask *= ~((gt_X.abs() < 3) * (gt_Y.abs() < 3))
+            else:
+                gt_center_ignore *= ~((gt_X.abs() < self.center_ignore_px) * (gt_Y.abs() < self.center_ignore_px))
+                gt_center_mask = gt_center_ignore
 
-                                in_mask = instances[b].eq(id).unsqueeze(0)
+            gt_R = torch.sqrt(torch.pow(gt_X, 2) + torch.pow(gt_Y, 2)) * instance_mask.float()
+            gt_theta = torch.atan2(gt_Y, gt_X)
+            gt_sin_th = torch.sin(gt_theta) * instance_mask.float()
+            gt_cos_th = torch.cos(gt_theta) * instance_mask.float()
 
-                                if centers is None:
-                                    # calculate center of attraction
-                                    xy_in = xym_s[in_mask.expand_as(xym_s)].view(2, -1)
-                                    center = xy_in.mean(1).view(2, 1, 1)  # 2 x 1 x 1
-                                else:
-                                    center = centers[b,id.item()-1,:]
+            # normalize groundtruth vector to 1 for all instance pixels
+            gt_M = torch.sqrt(torch.pow(gt_sin_th, 2) + torch.pow(gt_cos_th, 2))
+            gt_sin_th[instance_mask] = gt_sin_th[instance_mask] / gt_M[instance_mask]
+            gt_cos_th[instance_mask] = gt_cos_th[instance_mask] / gt_M[instance_mask]
 
-                                gt_centers[id.item()] = center.squeeze()[[1, 0]]
+            centerdir_gt_b['gt_R'] = gt_R
+            centerdir_gt_b['gt_theta'] = gt_theta
+            centerdir_gt_b['gt_sin_th'] = gt_sin_th
+            centerdir_gt_b['gt_cos_th'] = gt_cos_th
 
-                                gt_center_x[in_mask] = center[1].float()
-                                gt_center_y[in_mask] = center[0].float()
+        if gt_center_mask.all() or self.skip_gt_center_mask_generate:
+            gt_center_mask = torch.zeros_like(gt_center_mask)
+        else:
+            gt_center_mask = self.gaussian_blur(1 - gt_center_mask.unsqueeze(0).float())[0]
+            gt_center_mask /= gt_center_mask.max()
 
-                            instance_mask = instances[b].unsqueeze(0) > 0
+        centerdir_gt_b['gt_center_ignore'] = gt_center_ignore
+        centerdir_gt_b['gt_center_mask'] = gt_center_mask
 
+        return centerdir_gt_b
 
-                    # do nothing if no centers
-                    if gt_center_x is not None and gt_center_y is not None:
+    def _generate_extented_instance_mask(self, sample, b, gt_centers, gt_center_x, gt_center_y, instance_mask, xym_s):
+        instances = sample['instance'][b,0]
 
-                        gt_X = gt_center_x - xym_s[1].unsqueeze(0)
-                        gt_Y = gt_center_y - xym_s[0].unsqueeze(0)
+        centerdir_gt_b = {}
 
-                        if self.center_ignore_px <= 0:
-                            # just set gt_center_mask with default distance vals but not gt_center_ignore
-                            if not self.skip_gt_center_mask_generate:
-                                gt_center_mask *= ~((gt_X.abs() < 3) * (gt_Y.abs() < 3))
-                        else:
-                            gt_center_ignore *= ~((gt_X.abs() < self.center_ignore_px) * (gt_Y.abs() < self.center_ignore_px))
-                            gt_center_mask = gt_center_ignore
+        if self.extend_instance_mask_weights:
+            gt_extended_instances = instances.clone().type(torch.int16)
+            bg_mask = instances == 0
 
-                        gt_R = torch.sqrt(torch.pow(gt_X, 2) + torch.pow(gt_Y, 2)) * instance_mask.float()
-                        gt_theta = torch.atan2(gt_Y, gt_X)
-                        gt_sin_th = torch.sin(gt_theta) * instance_mask.float()
-                        gt_cos_th = torch.cos(gt_theta) * instance_mask.float()
+            # ditlate samples only when using instance mask and not closest center
+            if not self.ignore_instance_mask_and_use_closest_center:
 
-                        # normalize groundtruth vector to 1 for all instance pixels
-                        gt_M = torch.sqrt(torch.pow(gt_sin_th, 2) + torch.pow(gt_cos_th, 2))
-                        gt_sin_th[instance_mask] = gt_sin_th[instance_mask] / gt_M[instance_mask]
-                        gt_cos_th[instance_mask] = gt_cos_th[instance_mask] / gt_M[instance_mask]
+                for id in instances.unique():
+                    if id <= 0: continue
 
-                        centerdir_gt[0][b, 0] = gt_R
-                        centerdir_gt[0][b, 1] = gt_theta
-                        centerdir_gt[0][b, 2] = gt_sin_th
-                        centerdir_gt[0][b, 3] = gt_cos_th
+                    # Flat binary dilation: a pixel belongs if any pixel in its
+                    # square neighborhood belongs. Explicit zero padding keeps
+                    # the image size, with the extra pad on bottom/right for
+                    # even kernels. Index only batch/channel, not spatial axes.
+                    kernel = self.extend_instance_mask_weights
+                    before, after = (kernel - 1) // 2, kernel // 2
+                    in_mask = instances.eq(id)[None, None].float()
+                    padded = F.pad(in_mask, (before, after, before, after))
+                    mask_dilated = F.max_pool2d(padded, kernel, stride=1)[0, 0] > 0
 
-                        if orientation is not None:
-                            # locations where original orientation is read
-                            id_x = gt_center_x[instance_mask].long()
-                            id_y = gt_center_y[instance_mask].long()
+                    gt_extended_instances[mask_dilated * bg_mask] = id.type(gt_extended_instances.dtype)
 
-                            ROT_DIMS = orientation.shape[1]
-                            
-                            # orientation may hold confidence score at the end as well
-                            has_confidence_score = ROT_DIMS == 2 or ROT_DIMS == 4
-                            if has_confidence_score:
-                                ROT_DIMS -= 1
+            centerdir_gt_b['gt_extended_instances'] = gt_extended_instances
+            centerdir_gt_b['gt_extend_instance_mask_weights'] = self.extend_instance_mask_weights
 
-                            assert ROT_DIMS > 0 and ROT_DIMS < 4
+        return centerdir_gt_b
 
-                            angle = orientation[b,0:ROT_DIMS, id_x, id_y]
+    def _generate_custom_regression_map(self, sample, b, gt_centers, gt_center_x, gt_center_y, instance_mask, xym_s):
 
-                            # locations where orientations are stored
-                            out_id = torch.nonzero(instance_mask[0])
-                            centerdir_gt[0][b, 6:6+ROT_DIMS, 0, out_id[:,0], out_id[:,1]] = torch.sin(angle)
-                            centerdir_gt[0][b, 9:9+ROT_DIMS, 0, out_id[:,0], out_id[:,1]] = torch.cos(angle)
+        centerdir_gt_b = {}
 
-                            if has_confidence_score:
-                                centerdir_gt[0][b, 12:13, 0, out_id[:,0], out_id[:,1]] = orientation[b, -1, id_x, id_y]
+        if gt_center_x is not None and gt_center_y is not None:
+            # locations where original values will be read from
+            id_x = gt_center_x[instance_mask].long()
+            id_y = gt_center_y[instance_mask].long()
 
+            # locations where values are stored to
+            out_id = torch.nonzero(instance_mask[0])
 
-                    if update_centerdir_vals:
-                        if gt_center_mask.all() or self.skip_gt_center_mask_generate:
-                            gt_center_mask = torch.zeros_like(gt_center_mask)
-                        else:
-                            gt_center_mask = self.gaussian_blur(1 - gt_center_mask.unsqueeze(0).float())[0]
-                            gt_center_mask /= gt_center_mask.max()
+            for keys, fn in self.custom_regression_maps.items():
+                key,out_key = keys if type(keys) in [tuple,list] else (keys,keys)
 
-                        centerdir_gt[0][b, 4] = gt_center_ignore
-                        centerdir_gt[0][b, 5] = gt_center_mask
+                if key in sample:
+                    centerdir_gt_b.update(fn(sample[key][b], out_key, id_x, id_y, out_id, xym_s.device))
 
-                        centerdir_gt[2][b] = gt_centers
-
-
-        return centerdir_gt
+        return centerdir_gt_b
 
     @staticmethod
-    def parse_groundtruth(centerdir_gt, ignore_mask=None, return_orientation=False):
+    def parse_groundtruth(centerdir_gt, ignore_mask=None, return_orientation=False, return_radius=False, return_flux=False):
         if return_orientation:
             keys = ['gt_R', 'gt_theta', 'gt_sin_th', 'gt_cos_th', 'gt_orientation_sin', 'gt_orientation_cos',
+                    'gt_centers', 'gt_center_ignore', 'gt_center_mask', 'gt_extended_instances']
+        elif return_radius:
+            keys = ['gt_R', 'gt_theta', 'gt_sin_th', 'gt_cos_th', 'gt_radius',
+                    'gt_centers', 'gt_center_ignore', 'gt_center_mask', 'gt_extended_instances']
+        elif return_flux:
+            keys = ['gt_R', 'gt_theta', 'gt_sin_th', 'gt_cos_th', 'gt_flux',
                     'gt_centers', 'gt_center_ignore', 'gt_center_mask', 'gt_extended_instances']
         else:
             keys = ['gt_R', 'gt_theta', 'gt_sin_th', 'gt_cos_th',  'gt_centers', 'gt_center_ignore',
@@ -250,49 +356,21 @@ class CenterDirGroundtruth(nn.Module):
 
     @staticmethod
     def parse_groundtruth_map(centerdir_gt, keys=None):
-        gt_R, gt_theta, gt_sin_th, gt_cos_th = centerdir_gt[0][:, 0], centerdir_gt[0][:, 1], centerdir_gt[0][:, 2], centerdir_gt[0][:,3]
-        gt_orientation_sin, gt_orientation_cos = centerdir_gt[0][:, 6:9], centerdir_gt[0][:, 9:12]
-        gt_confidence_score = centerdir_gt[0][:, 12:13]
-
-        gt_centers, gt_center_ignore, gt_center_mask = centerdir_gt[2], centerdir_gt[0][:, 4], centerdir_gt[0][:, 5]
-
-        gt_extended_instances = centerdir_gt[4][:]
-
-        vars = gt_R, gt_theta, gt_sin_th, gt_cos_th, gt_orientation_sin, gt_orientation_cos, gt_centers, gt_center_ignore, gt_center_mask, gt_extended_instances, gt_confidence_score
-        names = 'gt_R', 'gt_theta', 'gt_sin_th', 'gt_cos_th', 'gt_orientation_sin', 'gt_orientation_cos', 'gt_centers', 'gt_center_ignore', 'gt_center_mask', 'gt_extended_instances', 'gt_confidence_score'
-
-        # combine into dictionary
-        gt_maps = dict(zip(names,vars))
-
-        if keys is None:
-            return gt_maps
+        if centerdir_gt is None:
+            centerdir_gt = {}
+            out_size = [0,0,0]
         else:
-            return [gt_maps[k] for k in keys] if len(keys) > 1 else gt_maps[keys[0]]
+            if len(centerdir_gt['height'].shape) > 0:
+                out_size = [len(centerdir_gt['height']), int(centerdir_gt['height'][0]), int(centerdir_gt['width'][0])]
+            else:
+                out_size = [int(centerdir_gt['height']), int(centerdir_gt['width'])]
 
-    @staticmethod
-    def parse_single_batch_groundtruth_map(centerdir_gt, keys=None):
-
-        gt_R, gt_theta, gt_sin_th, gt_cos_th = centerdir_gt[0], centerdir_gt[1], centerdir_gt[2], centerdir_gt[3]
-        gt_orientation_sin, gt_orientation_cos = centerdir_gt[6:9], centerdir_gt[9:12]
-        gt_confidence_score = centerdir_gt[12:13]
-
-        gt_center_ignore, gt_center_mask = centerdir_gt[4], centerdir_gt[5]
-
-        vars = gt_R, gt_theta, gt_sin_th, gt_cos_th, gt_orientation_sin, gt_orientation_cos, gt_center_ignore, gt_center_mask, gt_confidence_score
-        names = 'gt_R', 'gt_theta', 'gt_sin_th', 'gt_cos_th', 'gt_orientation_sin', 'gt_orientation_cos', 'gt_center_ignore', 'gt_center_mask', 'gt_confidence_score'
-
-        # combine into dictionary
-        gt_maps = dict(zip(names,vars))
-
-        if keys is None:
-            return gt_maps
-        else:
-            return [gt_maps[k] for k in keys] if len(keys) > 1 else gt_maps[keys[0]]
-
+        ret = [centerdir_gt[k] if k in centerdir_gt else torch.zeros(out_size) for k in keys]
+        return ret if len(keys) > 1 else ret[0]
 
     @staticmethod
     def get_groundtruth_instance_polygon(centerdir_gt):
-        return centerdir_gt[5] if len(centerdir_gt) > 5 else None
+        return centerdir_gt.get('instance_polygon')
 
     @staticmethod
     def convert_gt_centers_to_dictionary(gt_centers, instances, ignore=None):
@@ -314,19 +392,31 @@ class CenterDirGroundtruth(nn.Module):
             gt_centers_dict.append(center_dict)
 
         return gt_centers_dict
-    
-    def _init_datastructure(self, h, w):
-        extended_instances_num = 0
-        extended_instances = torch.zeros([h, w], dtype=torch.int16, requires_grad=False)
 
-        centers = torch.zeros(size=[self.MAX_NUM_CENTERS, 2], dtype=torch.float, requires_grad=False)
+    def get_load_cache_fn(self):
+        return lambda f, h, w: self._load_from_cache(f,h,w)
 
-        centerdir_gt_matrix = torch.zeros(size=[13, 1, h, w], dtype=torch.float, requires_grad=False)
-        centerdir_gt_present = 0
+    def _load_from_cache(self, filename, h, w):
+        raise Exception("Caching of centerdir_groundtruth is not supported any more !!")
 
-        output = None
+    def _create_synthetic_output(self, centerdir_gt, label):
+        gt_R, gt_sin_th, gt_cos_th = CenterDirGroundtruth.parse_groundtruth_map(centerdir_gt,keys=['gt_R', 'gt_sin_th', 'gt_cos_th'])
+        output = torch.cat((gt_sin_th,
+                            gt_cos_th,
+                            torch.log10(gt_R + 1),
+                            label.float()),dim=1)
+        return output
 
-        return (centerdir_gt_matrix, centerdir_gt_present, centers, extended_instances_num, extended_instances), output
+    def insert_cached_model(self, model, sample):
+
+        if self.use_cached_backbone_output == False and self.save_cached_backbone_output_only == False:
+            return model
+        else:
+            # save actual model (model.module) to prevent recursive construction (and consequential GPU memory leaks)
+            return CachedOutputModel(model.module, sample['output'], sample['im_name'],
+                                     self.use_cached_backbone_output,
+                                     self.save_cached_backbone_output_only,
+                                     self.backbone_output_cache)
     @staticmethod
     def find_closest_center(centers, instances, xym_s):
         assert len(instances.shape) == 2
@@ -369,3 +459,33 @@ class CenterDirGroundtruth(nn.Module):
 
         return closest_center_index.reshape(instances.shape)
 
+
+
+class CachedOutputModel:
+    def __init__(self, module, output, im_names, use_cached_backbone_output, save_cached_backbone_output_only,
+                 backbone_output_cache):
+        self.module = module
+        self.output = output
+        self.im_names = im_names
+        self.use_cached_backbone_output = use_cached_backbone_output
+        self.save_cached_backbone_output_only = save_cached_backbone_output_only
+        self.backbone_output_cache = backbone_output_cache
+
+    def __call__(self, input):
+        if self.use_cached_backbone_output:
+            output = self.output.to(input.device)
+        else:
+            output = self.module(input)
+
+        if self.save_cached_backbone_output_only:
+            try: os.makedirs(self.backbone_output_cache)
+            except: pass
+
+            for i in range(len(input)):
+                filename = os.path.basename(self.im_names[i])
+                cached_output_filename = os.path.join(self.backbone_output_cache,
+                                                      '%s_output_cache.npy' % filename)
+                np.save(cached_output_filename, np.array(output[i, :].detach().cpu(), dtype=np.float32))
+            output = None
+
+        return output

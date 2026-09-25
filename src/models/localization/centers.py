@@ -386,5 +386,3 @@ class Conv2dDilatedLocalization(Conv1dMultiscaleLocalization):
 
         conv_resp_intermediate = []
         return conv_resp, conv_resp_intermediate
-
-

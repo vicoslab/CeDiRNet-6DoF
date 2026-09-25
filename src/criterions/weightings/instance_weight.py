@@ -74,4 +74,3 @@ class InstanceGroupWeighting(UnbalancedWeighting):
                 # instance_normalization = instance_normalization * _N
                 W[b][mask_id] *= 1.0 / instance_normalization
         return W
-

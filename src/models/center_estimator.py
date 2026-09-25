@@ -6,8 +6,7 @@ import numpy as np
 from models.center_augmentator import CenterAugmentator
 
 from models.localization.centers import Conv1dMultiscaleLocalization, Conv2dDilatedLocalization
-
-import torch.nn.functional as F
+from models.center_groundtruth import CenterDirGroundtruth
 
 class CenterEstimator(nn.Module):
     def __init__(self, args=dict(), is_learnable=True):
@@ -15,7 +14,10 @@ class CenterEstimator(nn.Module):
 
         self.return_backbone_only = False
 
+        self.suppression_by_mask = args.get('suppression_by_mask')
         self.use_magnitude_as_mask = args.get('use_magnitude_as_mask')
+        self.add_edges_to_area_score = args.get('add_edges_to_area_score')
+        self.mask_inference_on_gorundtruth_points_only = args.get('mask_inference_on_gorundtruth_points_only', False)
 
         instance_center_estimator_op = Conv1dMultiscaleLocalization
         if args.get('use_dilated_nn'):
@@ -34,6 +36,15 @@ class CenterEstimator(nn.Module):
             use_findcontours_for_local_max=args.get('use_findcontours_for_local_max', False),
         )
 
+        self.instance_mask_estimator = None
+        if self.suppression_by_mask:
+            raise NotImplementedError("suppression_by_mask is not supported in the public release")
+        if self.add_edges_to_area_score:
+            raise NotImplementedError("add_edges_to_area_score is not supported in the public release")
+        if self.mask_inference_on_gorundtruth_points_only:
+            raise NotImplementedError("mask_inference_on_gorundtruth_points_only is not supported in the public release")
+        if args.get('use_fourier_instance', False):
+            raise NotImplementedError("use_fourier_instance is not supported in the public release")
         if args.get('augmentation'):
             self.center_augmentator = CenterAugmentator(
                 **args.get('augmentation_kwargs'),
@@ -64,7 +75,10 @@ class CenterEstimator(nn.Module):
         else:
             raise Exception('Only "exp" and "10" are allowed logarithms for R')
 
-        self.MAX_NUM_CENTERS = 16*128
+        self.MAX_NUM_CENTERS = 4*512
+
+        self.ignore_cls_prediction = args.get('ignore_cls_prediction', False)
+        self.ignore_centerdir_magnitude = args.get('ignore_centerdir_magnitude', False)
 
     def set_return_backbone_only(self, val):
         self.return_backbone_only = val
@@ -89,33 +103,37 @@ class CenterEstimator(nn.Module):
         assert input.shape[1] >= self.num_vector_fields
 
         predictions = input[:, 0:self.num_vector_fields]
+        cls_mask = input[:, self.num_vector_fields:]  # 1 x h x w
 
         S = predictions[:, 0].unsqueeze(1)
         C = predictions[:, 1].unsqueeze(1)
         R = predictions[:, 2].unsqueeze(1)
+        M = torch.sqrt(torch.pow(S, 2) + torch.pow(C, 2))
 
         R = self.inverse_log_r_fn(self.scale_r_fn(R))
 
-        cls_mask = torch.zeros_like(S, requires_grad=False)
-        M = torch.zeros_like(S, requires_grad=False)
 
-        pred_mask = None
+        if self.ignore_cls_prediction:
+            # just set to ZERO for legacy compatibility (original center models require this channel )
+            cls_mask = torch.zeros_like(cls_mask, requires_grad=False)
+        if self.ignore_centerdir_magnitude:
+            # just set to ZERO for legacy compatibility (original center models require this channel )
+            M = torch.zeros_like(M, requires_grad=False)
 
         if self.training:
             # during training only detect centers but do not do any filtering
             center_pred, conv_resp = self.instance_center_estimator(C, S, R, M, cls_mask)
-
         else:
             # during inference detect centers and do additional filtering and scoring if requested
 
             # apply R adjustment for log directly to input and GT data only during testing
             if self.use_log_r and 'centerdir_groundtruth' in gt and not ignore_gt:
                 input[:, 2:3] = R
-                gt['centerdir_groundtruth'][0][:, 0] = self.scale_r_gt_fn(gt['centerdir_groundtruth'][0][:, 0])
+                gt['centerdir_groundtruth']['gt_R'] = self.scale_r_gt_fn(CenterDirGroundtruth.parse_groundtruth_map(gt.get('centerdir_groundtruth'),keys=['gt_R']))
 
             mask = M if self.use_magnitude_as_mask else (cls_mask * (cls_mask > 0).type(torch.float32))
 
-            # use only ignore flag == 1 here
+            # use only ignore flag == 1 here, but have all remaining ignore types handled afterwards
             res, conv_resp = self.instance_center_estimator(C, S, R, M, mask,
                                                             ignore_region=ignore & 1 if ignore is not None else None)
 
@@ -123,9 +141,11 @@ class CenterEstimator(nn.Module):
             conv_resp = torch.relu(conv_resp)
 
             res = torch.cat((res, torch.ones((len(res),1),device=res.device)),dim=1)
+            #res = [np.concatenate((x, [1.0]), axis=0) for x in res]
 
             res = res.cpu().numpy()
             if len(res) > 0:
+                #idx = np.argsort(res[:, 3])
                 idx = np.lexsort((res[:, 3],res[:, 4]))
                 res = res[idx[::-1], :]
 
@@ -133,51 +153,27 @@ class CenterEstimator(nn.Module):
             if res.shape[0] > 2000:
                 res = res[:2000, :]
 
-            if len(res) > 0:
-                selected_centers = np.ones(len(res),dtype=bool)
+            if len(res) > 0 and ignore is not None:
+                selected_centers = np.ones(len(res), dtype=bool)
+                ignore_np = ignore.clone().cpu().numpy()
                 for b in range(len(input)):
                     batch_idx = res[:, 0] == b
                     centers_b = res[batch_idx][:, [2, 1, 4]]
-
-                    if ignore is not None and len(res) > 0:
-                        # consider all ignore flags except DIFFICULT and padding (8==DIFFICULT; 64,128=PADDING) one which will be handled by evaluation
-                        ignored_pred = np.array([ignore.clone().cpu().numpy()[b, 0, int(r[0]), int(r[1])] & (255 - 8 - 64 - 128) == 0 for r in centers_b]).astype(bool)
-
-                        if not np.all(ignored_pred):
-                            selected_centers[batch_idx] *= ignored_pred
-                            
-
+                    ignored_pred = np.array([
+                        ignore_np[b, 0, int(r[0]), int(r[1])] & (255 - 8 - 64 - 128) == 0
+                        for r in centers_b
+                    ]).astype(bool)
+                    selected_centers[batch_idx] *= ignored_pred
                 center_pred = res[selected_centers, :]
             else:
                 center_pred = res
-
-            # res = (batch, x,y, mask_score, center_score)
-            # voted_mask = 2D array of integers that match (1-based) index of centers in res
-            # conv_resp_out = list of 2D array with various respones (conv2d for center response, voted_mask, M, etc)
 
         center_pred = torch.tensor(center_pred).to(input.device)
 
         # convert center prediction list to tensor of fixed size so that it can be merger from parallel GPU processings
         center_pred = self._pack_center_predictions(center_pred, batch_size=len(input))
 
-        return dict(output=input, center_pred=center_pred, center_heatmap=conv_resp)
-
-    @staticmethod
-    def _get_edges_to_area_score(res, voted_mask):
-
-        # # calculate mask score based on number of edges to area ratio
-        # #is_edge = cv2.filter2D(voted_mask.astype(np.float32), -1, np.ones((3, 3)) / 9.0) != voted_mask
-        voted_mask = voted_mask.type(torch.float32)
-        is_edge = F.conv2d(voted_mask.unsqueeze(0).unsqueeze(0),
-                           torch.ones((3, 3), dtype=torch.float32, device=voted_mask.device).reshape(1, 1, 3, 3) / 9.0,
-                           padding=1)
-        is_edge = (torch.abs(is_edge - voted_mask) > 1 / 9.0).squeeze().type(torch.float32)
-        is_edge_score = [(1 - is_edge[voted_mask == i + 1].sum() / (voted_mask == i + 1).sum()).item() for i, _ in
-                         enumerate(res)]
-        return is_edge_score
-        #is_edge_score = np.expand_dims(is_edge_score, axis=1)
-
-        #return np.concatenate((res, is_edge_score), axis=1)
+        return dict(output=input, center_pred=center_pred, center_heatmap=conv_resp, pred_mask=None)
 
     def _pack_center_predictions(self, center_pred, batch_size):
         center_pred_all = torch.zeros((batch_size, self.MAX_NUM_CENTERS, center_pred.shape[1] if len(center_pred) > 0 else 5),

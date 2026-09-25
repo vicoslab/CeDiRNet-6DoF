@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this code or the released models, please cite the paper."
+title: "CeDiRNet-6DoF: 6-DoF grasp pose estimation for cloth unfolding"
+type: software
+authors:
+  - family-names: Tabernik
+    given-names: Domen
+  - family-names: Nimac
+    given-names: Peter
+  - family-names: Jerićević
+    given-names: Jan
+  - family-names: Skočaj
+    given-names: Danijel
+  - family-names: Gams
+    given-names: Andrej
+preferred-citation:
+  type: article
+  title: "Vision-Based 6-DoF Grasp Pose Estimation for Robot Cloth Unfolding"
+  authors:
+    - family-names: Tabernik
+      given-names: Domen
+    - family-names: Nimac
+      given-names: Peter
+    - family-names: Jerićević
+      given-names: Jan
+    - family-names: Skočaj
+      given-names: Danijel
+    - family-names: Gams
+      given-names: Andrej
+  journal: "IEEE Transactions on Cybernetics"
+  year: 2026
+  doi: "10.1109/TCYB.2026.3732543"

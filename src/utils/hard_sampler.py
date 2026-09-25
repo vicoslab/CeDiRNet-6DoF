@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import Sampler
 import pickle
 
-from datasets import LockableSeedRandomAccess
+from datasets.LockableSeedRandomAccess import LockableSeedRandomAccess
 
 class IHardExamplesBatchSampler:
     def has_hard_samples(self):

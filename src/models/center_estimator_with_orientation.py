@@ -2,23 +2,30 @@ import torch
 
 from models.center_estimator import CenterEstimator
 from models.center_estimator_fast import CenterEstimatorFast
+from utils.utils_3d import quaternion_to_euler_matrix
 
 class CenterOrientationEstimator(CenterEstimator):
     def __init__(self, args=dict(), is_learnable=True):
         super(CenterOrientationEstimator, self).__init__(args, is_learnable=is_learnable)
 
         self.enable_6dof = args.get('enable_6dof')
+        self.enable_world_pose = args.get('enable_world_pose')
         self.use_orientation_confidence_score = args.get('use_orientation_confidence_score')
+        self.use_quaternions = args.get('use_quaternions')
+
 
     def init_output(self, num_vector_fields=1):
         super(CenterOrientationEstimator, self).init_output(num_vector_fields)
 
-        REQUIRED_VECTOR_FIELDS = 5
-        if self.enable_6dof:
-            REQUIRED_VECTOR_FIELDS += 4 
+        if self.use_quaternions:
+            REQUIRED_VECTOR_FIELDS = 3 + 4
+        else:
+            REQUIRED_VECTOR_FIELDS = 5
+            if self.enable_6dof:
+                REQUIRED_VECTOR_FIELDS += 4
         if self.use_orientation_confidence_score:
             REQUIRED_VECTOR_FIELDS += 1
-        
+
         assert self.num_vector_fields >= REQUIRED_VECTOR_FIELDS
 
     def forward(self, input, ignore_gt=False, **gt):
@@ -34,14 +41,19 @@ class CenterOrientationEstimator(CenterEstimator):
         num_pred = center_pred.shape[1]
 
         # WARNING: this assumes CenterEstimator is used as parent WITHOUT fourier (!!)
-        if self.enable_6dof:
-            sin_orientation = predictions[:, 3:6]
-            cos_orientation = predictions[:, 6:9]
-        else:
-            sin_orientation = predictions[:, 3:4]
-            cos_orientation = predictions[:, 4:5]
+        if self.use_quaternions:
+            assert self.enable_6dof, "CenterOrientationEstimator requires enable_6dof=True when using use_quaternions=True"
 
-        prediction_angles = torch.zeros((batch_size,num_pred,sin_orientation.shape[1]))
+            quat_orientation = predictions[:, 3:7]
+        else:
+            if self.enable_6dof:
+                sin_orientation = predictions[:, 3:6]
+                cos_orientation = predictions[:, 6:9]
+            else:
+                sin_orientation = predictions[:, 3:4]
+                cos_orientation = predictions[:, 4:5]
+
+        prediction_angles = torch.zeros((batch_size,num_pred,3 if self.enable_6dof else 1))
 
         if self.use_orientation_confidence_score:
             prediction_confidence_score = predictions[:, 9:10] if self.enable_6dof else predictions[:, 5:6]
@@ -52,9 +64,13 @@ class CenterOrientationEstimator(CenterEstimator):
             for i, pred in enumerate(center_pred[b]):
                 if pred[0] != 0:
                     x,y = pred[1:3]
-                    s = sin_orientation[b,:,int(y), int(x)]
-                    c = cos_orientation[b,:, int(y), int(x)]
-                    pred_angle = torch.atan2(c, s)
+                    if self.use_quaternions:
+                        pred_angle = quaternion_to_euler_matrix(quat_orientation[b,:,int(y), int(x)].reshape(-1,1))
+                        pred_angle = pred_angle[:,0]
+                    else:
+                        s = sin_orientation[b,:,int(y), int(x)]
+                        c = cos_orientation[b,:, int(y), int(x)]
+                        pred_angle = torch.atan2(c, s)
 
                     pred_angle = torch.rad2deg(pred_angle)
                     pred_angle += 360 * (pred_angle < 0).int()
@@ -65,14 +81,17 @@ class CenterOrientationEstimator(CenterEstimator):
                         orientation_confidence_score[b,i] = prediction_confidence_score[b,0,int(y), int(x)]
 
         # add orientations to list of returned values
-        ret['pred_angle'] = prediction_angles
+        if 'pred_attributes' not in ret:
+            ret['pred_attributes'] = dict(angle=prediction_angles)
+        else:
+            ret['pred_attributes']['angle'] = prediction_angles
 
         # add orientation confidence score to predictions if needed
         if self.use_orientation_confidence_score:
             ret['center_pred'] = torch.cat((center_pred,orientation_confidence_score),axis=2)
 
         return ret
-    
+
 
 import time
 
@@ -80,18 +99,22 @@ class CenterOrientationEstimatorFast(CenterEstimatorFast):
     def __init__(self, args=dict(), is_learnable=True):
         super(CenterOrientationEstimatorFast, self).__init__(args, is_learnable=is_learnable)
 
-        self.enable_6dof = args.get('enable_6dof')        
+        self.enable_6dof = args.get('enable_6dof')
         self.use_orientation_confidence_score = args.get('use_orientation_confidence_score')
+        self.use_quaternions = args.get('use_quaternions')
 
     def init_output(self, num_vector_fields=1):
         super(CenterOrientationEstimatorFast, self).init_output(num_vector_fields)
 
-        REQUIRED_VECTOR_FIELDS = 5
-        if self.enable_6dof:
-            REQUIRED_VECTOR_FIELDS += 4 
+        if self.use_quaternions:
+            REQUIRED_VECTOR_FIELDS = 3 + 4
+        else:
+            REQUIRED_VECTOR_FIELDS = 5
+            if self.enable_6dof:
+                REQUIRED_VECTOR_FIELDS += 4
         if self.use_orientation_confidence_score:
             REQUIRED_VECTOR_FIELDS += 1
-        
+
         assert self.num_vector_fields >= REQUIRED_VECTOR_FIELDS
 
 
@@ -103,18 +126,24 @@ class CenterOrientationEstimatorFast(CenterEstimatorFast):
 
         num_pred = center_pred.shape[0]
 
-        if self.enable_6dof:
-            sin_orientation = predictions[:, 3:6]
-            cos_orientation = predictions[:, 6:9]
+        # WARNING: this assumes CenterEstimator is used as parent WITHOUT fourier (!!)
+        if self.use_quaternions:
+            assert self.enable_6dof, "CenterOrientationEstimator requires enable_6dof=True when using use_quaternions=True"
+
+            quat_orientation = predictions[:, 3:7]
         else:
-            sin_orientation = predictions[:, 3:4]
-            cos_orientation = predictions[:, 4:5]
+            if self.enable_6dof:
+                sin_orientation = predictions[:, 3:6]
+                cos_orientation = predictions[:, 6:9]
+            else:
+                sin_orientation = predictions[:, 3:4]
+                cos_orientation = predictions[:, 4:5]
 
         if self.use_orientation_confidence_score:
             prediction_confidence_score = predictions[:, 9:10] if self.enable_6dof else predictions[:, 5:6]
             orientation_confidence_score = torch.zeros((num_pred,1)).to(center_pred.device)
 
-        prediction_angles = torch.zeros((num_pred,sin_orientation.shape[1]), device=predictions.device)
+        prediction_angles = torch.zeros((num_pred,3 if self.enable_6dof else 1), device=predictions.device)
 
         # for every predicted center point find its center
         for i, pred in enumerate(center_pred):
@@ -123,19 +152,22 @@ class CenterOrientationEstimatorFast(CenterEstimatorFast):
 
             score = pred[-1]
 
-            if self.use_orientation_confidence_score:                
-                confidence_score = prediction_confidence_score[batch,0, int(y), int(x)]                
+            if self.use_orientation_confidence_score:
+                confidence_score = prediction_confidence_score[batch,0, int(y), int(x)]
                 orientation_confidence_score[i,:] = confidence_score
-                
+
                 score *= confidence_score
-            
+
             if score <= 0.9:
                 continue
+            if self.use_quaternions:
+                pred_angle = quaternion_to_euler_matrix(quat_orientation[batch,:,int(y), int(x)].reshape(-1,1))
+                pred_angle = pred_angle[:,0]
+            else:
+                s = sin_orientation[batch,:, int(y), int(x)]
+                c = cos_orientation[batch,:, int(y), int(x)]
 
-            s = sin_orientation[batch,:, int(y), int(x)]
-            c = cos_orientation[batch,:, int(y), int(x)]
-            
-            pred_angle = torch.atan2(c, s)
+                pred_angle = torch.atan2(c, s)
 
             pred_angle = torch.rad2deg(pred_angle)
             pred_angle += 360 * (pred_angle < 0).int()
@@ -147,7 +179,7 @@ class CenterOrientationEstimatorFast(CenterEstimatorFast):
 
         # add orientations to list of returned values
         center_pred_with_rot = torch.cat((center_pred, prediction_angles.to(predictions.device)),axis=1)
-        
+
         end_orient = time.time()
         times = list(times)
         times[-1] = times[-1] + (end_orient-start_orient)

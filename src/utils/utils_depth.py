@@ -21,6 +21,39 @@ def get_surface_normal_by_depth(depth, K=None):
 	normal_unit[~np.isfinite(normal_unit).all(2)] = [0, 0, 1]
 	return normal_unit
 
+def get_surface_normal_by_depth_robust(depth, K):
+    # depth: (h,w) with actual metric depth
+    # K: (3,3) camera intrinsics [fx, 0, cx; 0, fy, cy; 0,0,1]
+
+    fx, fy = K[0,0], K[1,1]
+    cx, cy = K[0,2], K[1,2]
+
+    # Back project to 3D
+    h, w = depth.shape
+    u, v = np.meshgrid(np.arange(w), np.arange(h))
+    Z = depth
+    X = (u - cx) * Z / fx
+    Y = (v - cy) * Z / fy
+
+    # Compute spatial derivatives of 3D points
+    dX_dv, dX_du = np.gradient(X)
+    dY_dv, dY_du = np.gradient(Y)
+    dZ_dv, dZ_du = np.gradient(Z)
+
+    # Two tangent vectors
+    t1 = np.stack((dX_du, dY_du, dZ_du), axis=2)
+    t2 = np.stack((dX_dv, dY_dv, dZ_dv), axis=2)
+
+    normal = np.cross(t1, t2)
+    norm = np.linalg.norm(normal, axis=2, keepdims=True)
+    normal_unit = normal / (norm + 1e-8)
+
+    # Handle invalid: find pixels where any of the 3 components is not finite
+    invalid_mask = ~np.isfinite(normal_unit).all(axis=2)
+    normal_unit[invalid_mask] = [0, 0, 1]
+    return normal_unit
+
+
 def get_angle_from_depth(depth, household=False, k=15):
 	# https://math.stackexchange.com/questions/3433645/how-can-i-find-the-angle-of-the-surface-3d-plane
 
@@ -64,7 +97,7 @@ def get_normals(depth, normals_mode=1, household=False, k=15):
 	if normals_mode==1:
 		normals = get_angle_from_depth(depth, household=household, k=k)
 	elif normals_mode==2:
-		dx = cv2.Sobel(depth, cv2.CV_64F, 1, 0, ksize=k)     
+		dx = cv2.Sobel(depth, cv2.CV_64F, 1, 0, ksize=k)
 		dy = cv2.Sobel(depth, cv2.CV_64F, 0, 1, ksize=k)
 
 		dx[np.isnan(dx)]=0
@@ -126,7 +159,7 @@ def get_normals(depth, normals_mode=1, household=False, k=15):
 		# depth[~mask]=0
 
 
-		dx = cv2.Sobel(depth, cv2.CV_64F, 1, 0, ksize=k)     
+		dx = cv2.Sobel(depth, cv2.CV_64F, 1, 0, ksize=k)
 		dy = cv2.Sobel(depth, cv2.CV_64F, 0, 1, ksize=k)
 
 		dx[np.isnan(dx)]=0
@@ -151,7 +184,7 @@ def get_normals(depth, normals_mode=1, household=False, k=15):
 		# dy[x2-k:x2+k, :] = 0
 		# dy[:, y1-k:y1+k] = 0
 		# dy[:, y2-k:y2+k] = 0
-		
+
 
 		depth = np.dstack((dx,dy))
 
@@ -173,3 +206,294 @@ def rotate_depth(depth, R, K):
 	d_rotated = pc[-1,:].reshape(h,w)
 
 	return d_rotated
+
+
+def depth_to_point_cloud(depth, K):
+	"""
+	Convert depth map to 3D point cloud in camera coordinates.
+	
+	Args:
+		depth: (h, w) depth map in meters
+		K: (3, 3) camera intrinsic matrix
+		
+	Returns:
+		points: (h, w, 3) point cloud with X, Y, Z coordinates
+	"""
+	h, w = depth.shape
+	fx, fy = K[0, 0], K[1, 1]
+	cx, cy = K[0, 2], K[1, 2]
+
+	# Create pixel coordinate grids
+	u, v = np.meshgrid(np.arange(w), np.arange(h))
+
+	# Convert to camera coordinates
+	Z = depth
+	X = (u - cx) * Z / fx
+	Y = (v - cy) * Z / fy
+
+	points = np.dstack((X, Y, Z))
+	return points
+
+
+def compute_horizontal_disparity(depth, K, baseline=1.0):
+	"""
+	Compute horizontal disparity from depth.
+	
+	Disparity is inversely proportional to depth: d = f * B / Z
+	where f is focal length, B is baseline, Z is depth.
+	
+	Args:
+		depth: (h, w) depth map in meters
+		K: (3, 3) camera intrinsic matrix
+		baseline: baseline distance (for stereo cameras), default 1.0
+		
+	Returns:
+		disparity: (h, w) horizontal disparity map
+	"""
+	fx = K[0, 0]
+
+	# Avoid division by zero
+	valid_mask = depth > 0
+	disparity = np.zeros_like(depth)
+	disparity[valid_mask] = (fx * baseline) / depth[valid_mask]
+
+	return disparity
+
+
+def compute_height_above_ground(depth, K, camera_height=1.0, gravity_direction=None):
+	"""
+	Compute height above ground plane for each pixel.
+	
+	Args:
+		depth: (h, w) depth map in meters
+		K: (3, 3) camera intrinsic matrix
+		camera_height: height of camera above ground plane in meters
+		gravity_direction: (3,) unit vector pointing in gravity direction in camera frame
+						   Default is [0, 1, 0] (Y-down convention)
+						   
+	Returns:
+		height: (h, w) height above ground for each pixel
+	"""
+	if gravity_direction is None:
+		gravity_direction = np.array([0, 1, 0])  # Y-axis points down
+	gravity_direction = gravity_direction / np.linalg.norm(gravity_direction)
+
+	# Get 3D point cloud
+	points = depth_to_point_cloud(depth, K)
+
+	# Height is the projection onto gravity direction, offset by camera height
+	# For Y-down convention: height = camera_height - Y
+	height = camera_height - np.sum(points * gravity_direction, axis=-1)
+
+	# Set invalid depth regions to 0
+	height[depth <= 0] = 0
+
+	return height
+
+
+def compute_angle_with_gravity(depth, K, gravity_direction=None, gaussian_blur_k=5):
+	"""
+	Compute the angle between local surface normals and gravity direction.
+	
+	Args:
+		depth: (h, w) depth map in meters
+		K: (3, 3) camera intrinsic matrix
+		gravity_direction: (3,) unit vector pointing in gravity direction in camera frame
+						   Default is [0, 1, 0] (Y-down convention)
+		gaussian_blur_k: kernel size for Gaussian blur before computing normals
+		
+	Returns:
+		angle: (h, w) angle with gravity in radians [0, pi]
+	"""
+	if gravity_direction is None:
+		gravity_direction = np.array([0, 1, 0])
+	gravity_direction = gravity_direction / np.linalg.norm(gravity_direction)
+
+	# Smooth depth to reduce noise in normal estimation
+	if gaussian_blur_k > 0:
+		depth_smooth = cv2.GaussianBlur(depth, (gaussian_blur_k, gaussian_blur_k), 0)
+	else:
+		depth_smooth = depth
+
+	# Compute surface normals
+	normals = get_surface_normal_by_depth(depth_smooth, K)
+
+	# Compute dot product with gravity direction
+	# angle = arccos(dot(normal, gravity))
+	dot_product = np.sum(normals * gravity_direction, axis=-1)
+
+	# Clamp to valid range for arccos
+	dot_product = np.clip(dot_product, -1.0, 1.0)
+	angle = np.arccos(dot_product)
+
+	# Set invalid regions to 0
+	angle[depth <= 0] = 0
+
+	return angle
+
+
+def get_hha_encoding(depth, K=None, camera_height=1.0, gravity_direction=None,
+					 baseline=1.0, normalize=True, gaussian_blur_k=5):
+	"""
+	Compute HHA (Horizontal disparity, Height above ground, Angle with gravity) encoding.
+	
+	This converts a depth map into a 3-channel image where:
+	- Channel 0: Horizontal disparity (inversely proportional to depth)
+	- Channel 1: Height above ground plane
+	- Channel 2: Angle between local surface normal and gravity direction
+	
+	Reference: Gupta et al., "Learning Rich Features from RGB-D Images for Object 
+	Detection and Segmentation", ECCV 2014
+	
+	Args:
+		depth: (h, w) depth map in meters
+		K: (3, 3) camera intrinsic matrix. If None, uses default values.
+		camera_height: height of camera above ground plane in meters
+		gravity_direction: (3,) unit vector pointing in gravity direction in camera frame
+						   Default is [0, 1, 0] (Y-down convention)
+		baseline: baseline distance for disparity computation
+		normalize: if True, normalizes each channel to [0, 1] range
+		gaussian_blur_k: kernel size for Gaussian blur before computing normals
+		
+	Returns:
+		hha: (h, w, 3) HHA encoded image
+	"""
+	h, w = depth.shape
+
+	# Default camera intrinsics if not provided
+	if K is None:
+		fx = fy = min(h, w)
+		cx, cy = w / 2.0, h / 2.0
+		K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+
+	if gravity_direction is None:
+		gravity_direction = np.array([0, 1, 0])
+
+	# Compute the three channels
+	horizontal_disparity = compute_horizontal_disparity(depth, K, baseline)
+	height_above_ground = compute_height_above_ground(depth, K, camera_height, gravity_direction)
+	angle_with_gravity = compute_angle_with_gravity(depth, K, gravity_direction, gaussian_blur_k)
+
+	# Stack into HHA image
+	hha = np.dstack((horizontal_disparity, height_above_ground, angle_with_gravity))
+
+	if normalize:
+		hha = normalize_hha(hha, depth)
+
+	return hha
+
+
+def normalize_hha(hha, depth=None):
+	"""
+	Normalize HHA encoding to [0, 1] range for each channel.
+	
+	Args:
+		hha: (h, w, 3) HHA encoded image
+		depth: (h, w) original depth map (optional, used for masking invalid regions)
+		
+	Returns:
+		hha_normalized: (h, w, 3) normalized HHA image
+	"""
+	hha_normalized = np.zeros_like(hha)
+
+	# Create valid mask
+	if depth is not None:
+		valid_mask = depth > 0
+	else:
+		valid_mask = np.ones(hha.shape[:2], dtype=bool)
+
+	for i in range(3):
+		channel = hha[:, :, i]
+		valid_values = channel[valid_mask]
+
+		if len(valid_values) > 0:
+			min_val = np.percentile(valid_values, 1)  # Use percentiles for robustness
+			max_val = np.percentile(valid_values, 99)
+
+			if max_val > min_val:
+				normalized = (channel - min_val) / (max_val - min_val)
+				normalized = np.clip(normalized, 0, 1)
+			else:
+				normalized = np.zeros_like(channel)
+
+			hha_normalized[:, :, i] = normalized
+
+	# Zero out invalid regions
+	if depth is not None:
+		hha_normalized[~valid_mask] = 0
+
+	return hha_normalized
+
+
+def hha_to_uint8(hha):
+	"""
+	Convert normalized HHA encoding to uint8 image for visualization/saving.
+	
+	Args:
+		hha: (h, w, 3) HHA encoded image (should be normalized to [0, 1])
+		
+	Returns:
+		hha_uint8: (h, w, 3) uint8 image
+	"""
+	hha_uint8 = (np.clip(hha, 0, 1) * 255).astype(np.uint8)
+	return hha_uint8
+
+
+def get_hha_encoding_from_kinect(depth, camera_height=1.0, normalize=True):
+	"""
+	Compute HHA encoding using default Kinect camera parameters.
+	
+	Args:
+		depth: (h, w) depth map in meters (or millimeters, will be auto-detected)
+		camera_height: height of camera above ground plane in meters
+		normalize: if True, normalizes each channel to [0, 1] range
+		
+	Returns:
+		hha: (h, w, 3) HHA encoded image
+	"""
+	# Kinect v2 intrinsics (typical values)
+	K = np.array([
+		[1081.3720703125, 0, 959.5],
+		[0, 1081.3720703125, 539.5],
+		[0, 0, 1]
+	], dtype=np.float64)
+
+	# Auto-detect if depth is in millimeters and convert to meters
+	depth_float = depth.astype(np.float64)
+	if np.nanmax(depth_float) > 100:  # Likely in millimeters
+		depth_float = depth_float / 1000.0
+
+	return get_hha_encoding(depth_float, K, camera_height, normalize=normalize)
+
+
+def visualize_hha(hha, save_path=None):
+	"""
+	Visualize HHA encoding with separate plots for each channel.
+	
+	Args:
+		hha: (h, w, 3) HHA encoded image
+		save_path: if provided, saves the figure to this path
+	"""
+	fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+
+	# Channel names
+	channel_names = ['Horizontal Disparity', 'Height Above Ground', 'Angle with Gravity']
+	cmaps = ['viridis', 'RdYlBu', 'twilight']
+
+	for i, (name, cmap) in enumerate(zip(channel_names, cmaps)):
+		im = axes[i].imshow(hha[:, :, i], cmap=cmap)
+		axes[i].set_title(name)
+		axes[i].axis('off')
+		plt.colorbar(im, ax=axes[i], fraction=0.046, pad=0.04)
+
+	# Combined RGB view
+	axes[3].imshow(hha)
+	axes[3].set_title('HHA Combined')
+	axes[3].axis('off')
+
+	plt.tight_layout()
+
+	if save_path:
+		plt.savefig(save_path, dpi=150, bbox_inches='tight')
+
+	plt.show()

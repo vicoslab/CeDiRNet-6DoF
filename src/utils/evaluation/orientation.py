@@ -9,33 +9,85 @@ from models.center_groundtruth import CenterDirGroundtruth
 from utils.evaluation import NumpyEncoder
 from utils.evaluation.center_global_min import CenterGlobalMinimizationEval
 
+class ParseAxisOrientationGT():
+    def __init__(self, centerdir_gt):
+        gt_maps_keys = ['gt_orientation_sin', 'gt_orientation_cos']
+        sin, cos = CenterDirGroundtruth.parse_groundtruth_map(centerdir_gt, keys=gt_maps_keys)
+
+        self.sin = sin
+        self.cos = cos
+
+    def __call__(self, p, DIMS=3):
+        s = self.sin[0:DIMS,0,int(p[1]), int(p[0])]
+        c = self.cos[0:DIMS,0,int(p[1]), int(p[0])]
+
+        gt_angle_i = torch.atan2(c, s)
+        gt_angle_i = torch.rad2deg(gt_angle_i)
+        gt_angle_i += 360 * (gt_angle_i < 0).int()
+
+        return gt_angle_i
+
+class ParseQuaternionsOrientationGT():
+    def __init__(self, centerdir_gt):
+        gt_maps_keys = ['gt_orientation_quaternion']
+        quat = CenterDirGroundtruth.parse_groundtruth_map(centerdir_gt, keys=gt_maps_keys)
+
+        self.quat = quat
+
+    def __call__(self, p, DIMS=4):
+        quat = self.quat[0:4,0,int(p[1]), int(p[0])]
+
+        from scipy.spatial.transform import Rotation
+
+        gt_angle_i = Rotation.from_quat(quat.cpu().numpy()).as_euler(seq="xyz", degrees=True)
+        gt_angle_i = torch.from_numpy(gt_angle_i)
+        gt_angle_i += 360 * (gt_angle_i < 0).int()
+
+        return gt_angle_i
+
 class OrientationEval(CenterGlobalMinimizationEval):
 
-    def __init__(self, *args, use_gt_centers=False, append_orientation_to_display_name=True, **kwargs):
+    def __init__(self, *args, use_gt_centers=False, append_orientation_to_display_name=True, orientation_type='axis', **kwargs):
         super(OrientationEval, self).__init__(*args, **kwargs)
 
         self.use_gt_centers = use_gt_centers
         self.metrics.update(dict(rotation=[],translation=[], rot_x=[], rot_y=[], rot_z=[]))
         self.append_orientation_to_display_name = append_orientation_to_display_name
 
+        if orientation_type.lower() in ['axis', 'euler']:
+            self.gt_orientation_parser_cls = ParseAxisOrientationGT
+        elif orientation_type.lower() == 'quaternion':
+            self.gt_orientation_parser_cls = ParseQuaternionsOrientationGT
+        else:
+            raise Exception("Unsupported 'orientation_type' requested in OrientationEval class")
 
-    def add_image_prediction(self, im_name, im_index, im_shape, predictions, predictions_score, pred_angles,
+    def save_str(self):
+        return "tau=%.1f-score_thr=%.1f-center_ap_eval=%s" % (self.tau_thr, self.score_thr, str(self.center_ap_eval))
+
+
+    def add_image_prediction(self, sample, im_name, im_index, im_shape, predictions_data,
                              gt_instances_ids, gt_centers_dict, gt_difficult, centerdir_gt, return_matched_gt_idx=False,
                              **kwargs):
 
         # use parent class for center prediction matching
         ret = super(OrientationEval, self).add_image_prediction(
-            im_name, im_index, im_shape, predictions, predictions_score,
+            sample, im_name, im_index, im_shape, predictions_data,
             gt_instances_ids, gt_centers_dict, gt_difficult, centerdir_gt, return_matched_gt_idx=True)
 
         gt_missed, pred_missed, pred_gt_match_by_center, filename_suffix, pred_gt_match_by_center_idx = ret
 
-        gt_maps_keys = ['gt_orientation_sin', 'gt_orientation_cos']
-        gt_sin_orientation, gt_cos_orientation = CenterDirGroundtruth.parse_single_batch_groundtruth_map(centerdir_gt,
-                                                                                                         keys=gt_maps_keys)
-
         if filename_suffix is None:
             filename_suffix = ''
+
+        pred_centers = predictions_data['center']
+        pred_angles = predictions_data['angle']
+        pred_ids = sorted(pred_centers.keys())
+
+        if len(pred_ids) > 0:
+            predictions = np.array([pred_centers[id] for id in pred_ids])
+            pred_angles = np.array([pred_angles[id] for id in pred_ids])
+        else:
+            predictions,pred_angles = [],[]
 
         if pred_gt_match_by_center_idx.shape[0] != 0:
             gt_selected = np.array([gt_centers_dict[np.int16(i)][::-1] for i in pred_gt_match_by_center_idx[:,0] if i >= 0])
@@ -46,29 +98,70 @@ class OrientationEval(CenterGlobalMinimizationEval):
                 assert len(gt_selected) == sum(pred_gt_match_by_center[:,0] != 0)
 
                 trans_err = np.abs(predictions[pred_gt_match_by_center[:,0] != 0, :2] - gt_selected)
+                # print("trans_err", trans_err)
 
                 angle_err = []
+                err_thr = 10
 
-                num_orientation_dim = pred_angles.shape[1]
                 pred_angles = pred_angles[pred_gt_match_by_center[:,0] != 0,:]
+
+                symmetries = [6, 0, 0]
+
+                gt_parser = self.gt_orientation_parser_cls(centerdir_gt)
 
                 for i, c_gt in enumerate(gt_selected):
                     if pred_gt_match_by_center[i] == 0:
                         continue
 
-                    s = gt_sin_orientation[0:num_orientation_dim,0,int(c_gt[1]), int(c_gt[0])]
-                    c = gt_cos_orientation[0:num_orientation_dim,0,int(c_gt[1]), int(c_gt[0])]
+                    gt_angle_i = gt_parser(c_gt, DIMS=pred_angles.shape[1])
 
-                    gt_angle_i = torch.atan2(c, s)
-                    gt_angle_i = torch.rad2deg(gt_angle_i)
-                    gt_angle_i += 360 * (gt_angle_i < 0).int()
+                    # correct GT to align with symmetries
 
                     pred_angle_i = pred_angles[i]
 
                     e = np.abs(gt_angle_i.cpu().numpy() - pred_angle_i)
-                    
+
+                    # print("start")
+                    # print("gt_angle_i", gt_angle_i.cpu().numpy())
+
+                    for j, sym in enumerate(symmetries):
+                        if sym==0:
+                            continue
+
+                        min_e = e[j]
+                        best_idx = 0
+
+                        for k in range(sym):
+                            gt_angle_i_sym = gt_angle_i[j]+k*360/sym
+                            gt_angle_i_sym%=360
+                            gt_angle_i_ = gt_angle_i.clone()
+                            gt_angle_i_[j]=gt_angle_i_sym
+                            # print("pred_angle_i", pred_angle_i)
+                            # print("gt_angle_i_sym", gt_angle_i_sym)
+                            e_ = np.abs(gt_angle_i_.cpu().numpy() - pred_angle_i)
+                            is_e_over_180 = (e_ > 180).astype(np.int32)
+                            e_ = is_e_over_180 * 360 - (is_e_over_180*2-1) * e_
+                            # print("e_", e_)
+                            if e_[j]<min_e:
+                                min_e = e_[j]
+                                best_idx = k
+
+                        gt_angle_i[j]+=best_idx*(360/sym)
+                        gt_angle_i[j]%=360
+
+                    e = np.abs(gt_angle_i.cpu().numpy() - pred_angle_i)
                     is_e_over_180 = (e > 180).astype(np.int32)
                     e = is_e_over_180 * 360 - (is_e_over_180*2-1) * e # the same as: e = 360 - e if e > 180 else e
+
+                    # print("gt_angle_i", gt_angle_i.cpu().numpy())
+                    # print("pred_angle_i", pred_angle_i)
+                    # print("e", e)
+                    # print()
+
+                    # if e>err_thr:
+                    # 	print(c_pred)
+                    # 	print(c_gt[:2], c_pred[:2])
+                    # 	print(f"GT angle: {gt_angle}, pred angle: {pred_angle}, error: {e}")
 
                     angle_err.append(e)
 
@@ -121,6 +214,9 @@ class OrientationEval(CenterGlobalMinimizationEval):
             if RE_Z:
                 RES += ", rot_z=%.4f" % RE_Z
             print(RES)
+
+        if len(self.all_detections) > 0:
+            all_detections = np.concatenate(self.all_detections,axis=0)
 
         if self.center_ap_eval is not None:
             metrics_mAP = self.center_ap_eval.calc_and_display_final_metrics(print_result, plot_result)

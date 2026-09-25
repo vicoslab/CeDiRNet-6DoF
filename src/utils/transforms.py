@@ -1,4 +1,9 @@
-﻿import collections
+﻿try:
+    from collections.abc import Iterable
+except ImportError:
+    from collections import Iterable
+
+import json
 import random
 import os
 
@@ -36,19 +41,23 @@ class CropRandomObject:
 
         unique_objects = np.unique(object_map)
         unique_objects = unique_objects[unique_objects != 0]
-        
+
         if unique_objects.size > 0:
             random_id = rng.choice(unique_objects, 1)
 
             y, x = np.where(object_map == random_id)
             ym, xm = np.mean(y), np.mean(x)
-            
+
             i = int(np.clip(ym-self.size[1]/2, 0, h-self.size[1]))
             j = int(np.clip(xm-self.size[0]/2, 0, w-self.size[0]))
 
         else:
             i = rng.integers(max(1,h - self.size[1]))
             j = rng.integers(max(1,w - self.size[0]))
+
+        # Capture original size before crop
+        if len(self.keys) > 0:
+            _orig_size = get_image_size(sample[self.keys[0]])  # (w, h)
 
         for k in self.keys:
             assert(k in sample)
@@ -62,18 +71,91 @@ class CropRandomObject:
             assert (k in sample)
             assert isinstance(sample[k], torch.Tensor) or isinstance(sample[k], np.ndarray)
 
-            i,j = 0,1
+            bi,bj = 0,1
             # ignore first element if odd number of elements (we assume it is ID)
             if sample[k].shape[1] % 2 == 1:
-                i, j = i+1,j+1
+                bi, bj = bi+1,bj+1
                 idx = sample[k][:, 0] > 0
             else:
-                idx = (sample[k][:, i] != 0) * (sample[k][:, j] != 0)
+                idx = (sample[k][:, bi] != 0) * (sample[k][:, bj] != 0)
 
-            sample[k][idx, i] -= j
-            sample[k][idx, j] -= i
+            sample[k][idx, bi] -= j
+            sample[k][idx, bj] -= i
+
+        # Record transform for inverse
+        _record_transform(sample, 'CropRandomObject', {
+            'crop_i': i, 'crop_j': j,
+            'crop_h': self.size[1], 'crop_w': self.size[0],
+            'orig_w': _orig_size[0] if len(self.keys) > 0 else w,
+            'orig_h': _orig_size[1] if len(self.keys) > 0 else h,
+        })
 
         return sample
+
+    @staticmethod
+    def inverse(params, images=None, points=None, bboxes=None):
+        """Inverse of crop: pad image back to original size, shift points/bboxes.
+        
+        Args:
+            params: dict with crop parameters.
+            images: optional list of images (Tensor/ndarray/PIL) to inverse-transform.
+            points: optional list of (N, 2) arrays of (x, y) points.
+            bboxes: optional list of (N, 4+) arrays of bboxes.
+        
+        Returns:
+            dict with keys 'images', 'points', 'bboxes' for those that were provided.
+        """
+        result = {}
+        i, j = params['crop_i'], params['crop_j']
+        orig_h, orig_w = params['orig_h'], params['orig_w']
+        crop_h, crop_w = params['crop_h'], params['crop_w']
+
+        pad_left = j
+        pad_top = i
+        pad_right = orig_w - crop_w - j
+        pad_bottom = orig_h - crop_h - i
+
+        if images:
+            out_images = []
+            for img in images:
+                if isinstance(img, torch.Tensor):
+                    if len(img.shape) == 2:
+                        img = F.pad(img.unsqueeze(0), [pad_left, pad_top, pad_right, pad_bottom], fill=0)[0]
+                    else:
+                        img = F.pad(img, [pad_left, pad_top, pad_right, pad_bottom], fill=0)
+                elif isinstance(img, np.ndarray):
+                    if img.ndim == 2:
+                        img = np.pad(img, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='constant')
+                    else:
+                        img = np.pad(img, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), mode='constant')
+                elif isinstance(img, Image.Image):
+                    img = F.pad(img, [pad_left, pad_top, pad_right, pad_bottom], fill=0)
+                out_images.append(img)
+            result['images'] = out_images
+
+        if points:
+            out_points = []
+            for pts in points:
+                pts = np.array(pts, dtype=np.float64)
+                pts[:, 0] += params['crop_j']  # x offset
+                pts[:, 1] += params['crop_i']  # y offset
+                out_points.append(pts)
+            result['points'] = out_points
+
+        if bboxes:
+            out_bboxes = []
+            for bbs in bboxes:
+                bbs = np.array(bbs, dtype=np.float64)
+                if bbs.size > 0:
+                    i_col, j_col = 0, 1
+                    if bbs.shape[1] % 2 == 1:
+                        i_col, j_col = 1, 2
+                    bbs[:, i_col] += params['crop_j']
+                    bbs[:, j_col] += params['crop_i']
+                out_bboxes.append(bbs)
+            result['bboxes'] = out_bboxes
+
+        return result
 
 class RandomCrop(T.RandomCrop):
 
@@ -94,7 +176,7 @@ class RandomCrop(T.RandomCrop):
         self.keys = keys
         self.keys_bbox = keys_bbox
         self.keys_camK = keys_camK
-        self.fixed_offset = fixed_offset        
+        self.fixed_offset = fixed_offset
 
     def _pad_if_needed(self, img):
 
@@ -157,6 +239,15 @@ class RandomCrop(T.RandomCrop):
             return sample
 
         params = None
+        pad_size = None
+
+        # Capture original image size before any padding/cropping
+        if len(self.keys) > 0:
+            _first_key = self.keys[0]
+            _orig_size = get_image_size(sample[_first_key])  # (w, h)
+            orig_w, orig_h = _orig_size
+        else:
+            orig_w, orig_h = 0, 0
 
         for k in self.keys:
             assert(k in sample)
@@ -191,7 +282,7 @@ class RandomCrop(T.RandomCrop):
                 idx = (sample[k][:,i] > 0) | (sample[k][:,j] > 0)
             sample[k][idx, i] -= dy
             sample[k][idx, j] -= dx
-        
+
         for k in self.keys_camK:
             assert (k in sample)
             assert isinstance(sample[k], torch.Tensor) or isinstance(sample[k], np.ndarray)
@@ -202,13 +293,117 @@ class RandomCrop(T.RandomCrop):
             sample[k][0, 2] -= dy
             sample[k][1, 2] -= dx
 
+        # Record transform for inverse
+        _record_transform(sample, 'RandomCrop', {
+            'crop_i': params[0], 'crop_j': params[1],
+            'crop_h': params[2], 'crop_w': params[3],
+            'orig_w': orig_w, 'orig_h': orig_h,
+            'pad_size': pad_size if self.pad_if_needed else None,
+        })
+
         return sample
+
+    @staticmethod
+    def inverse(params, images=None, points=None, bboxes=None):
+        """Inverse of crop (and optional padding): pad back then un-pad.
+        
+        Args:
+            params: dict with crop parameters.
+            images: optional list of images to inverse-transform.
+            points: optional list of (N, 2) arrays of (x, y) points.
+            bboxes: optional list of (N, 4+) arrays of bboxes.
+        
+        Returns:
+            dict with keys 'images', 'points', 'bboxes' for those that were provided.
+        """
+        result = {}
+        i, j = params['crop_i'], params['crop_j']
+        orig_h, orig_w = params['orig_h'], params['orig_w']
+        crop_h, crop_w = params['crop_h'], params['crop_w']
+        pad_size = params.get('pad_size')
+
+        if pad_size is not None:
+            padded_w = orig_w + pad_size[0] + pad_size[2]
+            padded_h = orig_h + pad_size[1] + pad_size[3]
+        else:
+            padded_w = orig_w
+            padded_h = orig_h
+
+        pad_left = j
+        pad_top = i
+        pad_right = padded_w - crop_w - j
+        pad_bottom = padded_h - crop_h - i
+
+        if images:
+            out_images = []
+            for img in images:
+                if isinstance(img, torch.Tensor):
+                    if len(img.shape) == 2:
+                        img = F.pad(img.unsqueeze(0), [pad_left, pad_top, pad_right, pad_bottom], fill=0)[0]
+                    else:
+                        img = F.pad(img, [pad_left, pad_top, pad_right, pad_bottom], fill=0)
+                elif isinstance(img, np.ndarray):
+                    if img.ndim == 2:
+                        img = np.pad(img, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='constant')
+                    else:
+                        img = np.pad(img, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), mode='constant')
+                elif isinstance(img, Image.Image):
+                    img = F.pad(img, [pad_left, pad_top, pad_right, pad_bottom], fill=0)
+
+                # Then undo the padding if it was applied
+                if pad_size is not None:
+                    pl, pt, pr, pb = pad_size
+                    if isinstance(img, torch.Tensor):
+                        if len(img.shape) == 2:
+                            img = img[pt:img.shape[0] - pb if pb > 0 else img.shape[0],
+                                      pl:img.shape[1] - pr if pr > 0 else img.shape[1]]
+                        else:
+                            img = img[..., pt:img.shape[-2] - pb if pb > 0 else img.shape[-2],
+                                           pl:img.shape[-1] - pr if pr > 0 else img.shape[-1]]
+                    elif isinstance(img, np.ndarray):
+                        h, w = img.shape[0], img.shape[1]
+                        img = img[pt:h - pb if pb > 0 else h, pl:w - pr if pr > 0 else w]
+                    elif isinstance(img, Image.Image):
+                        w, h = img.size
+                        img = img.crop((pl, pt, w - pr if pr > 0 else w, h - pb if pb > 0 else h))
+                out_images.append(img)
+            result['images'] = out_images
+
+        if points:
+            out_points = []
+            for pts in points:
+                pts = np.array(pts, dtype=np.float64)
+                pts[:, 0] += params['crop_j']  # x
+                pts[:, 1] += params['crop_i']  # y
+                if pad_size is not None:
+                    pts[:, 0] -= pad_size[0]  # left pad
+                    pts[:, 1] -= pad_size[1]  # top pad
+                out_points.append(pts)
+            result['points'] = out_points
+
+        if bboxes:
+            out_bboxes = []
+            for bbs in bboxes:
+                bbs = np.array(bbs, dtype=np.float64)
+                if bbs.size > 0:
+                    i_col, j_col = 0, 1
+                    if bbs.shape[1] % 2 == 1:
+                        i_col, j_col = 1, 2
+                    bbs[:, i_col] += params['crop_j']
+                    bbs[:, j_col] += params['crop_i']
+                    if pad_size is not None:
+                        bbs[:, i_col] -= pad_size[0]
+                        bbs[:, j_col] -= pad_size[1]
+                out_bboxes.append(bbs)
+            result['bboxes'] = out_bboxes
+
+        return result
 
 class FixedCrop(RandomCrop):
     def __init__(self, loc=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.loc = loc
-    
+
     def get_params(self, img, output_size, fixed_offset=None, rng=None):
         i,j = self.loc
         th, tw = output_size
@@ -233,7 +428,7 @@ class CenterCrop(RandomCrop):
 
         w, h = get_image_size(img)
         th, tw = output_size
-        
+
         if w == tw and h == th:
             return 0, 0, h, w
 
@@ -255,7 +450,7 @@ class RandomCustomRotation(object):
         self.expand = expand
         self.center = center
 
-        if isinstance(self.resample, collections.Iterable):
+        if isinstance(self.resample, Iterable):
             assert (len(keys) == len(self.resample))
 
     @staticmethod
@@ -286,7 +481,7 @@ class RandomCustomRotation(object):
                 assert(k in sample)
 
                 resample = self.resample
-                if isinstance(resample, collections.Iterable):
+                if isinstance(resample, Iterable):
                     resample = resample[idx]
 
                 if type(sample[k]) == torch.Tensor and len(sample[k].shape) == 2:
@@ -301,6 +496,8 @@ class RandomCustomRotation(object):
                     new_im_size = get_image_size(sample[self.keys[0]])
                 assert org_im_size
                 assert new_im_size
+            elif len(self.keys) > 0:
+                new_im_size = get_image_size(sample[self.keys[0]])
 
                 old_center = (org_im_size[0]/2,org_im_size[1]/2) if self.center is None else self.center
                 new_center = (new_im_size[0]/2,new_im_size[1]/2) if self.expand else old_center
@@ -335,12 +532,108 @@ class RandomCustomRotation(object):
                     points[:, 1] += new_center[1]
 
                     sample[k][idx, i:] = points.reshape(org_shape)
-            
+
             if self.keys_custom_fn is not None:
                 for k,fn in self.keys_custom_fn.items():
                     sample[k] = fn(sample[k], angle)
 
+        if angle != 0:
+            _record_transform(sample, 'RandomCustomRotation', {
+                'angle': float(angle),
+                'expand': self.expand,
+                'center': self.center,
+                'org_im_size': org_im_size if len(self.keys) > 0 else None,
+                'new_im_size': new_im_size if len(self.keys) > 0 else None,
+            })
+
         return sample
+
+    @staticmethod
+    def inverse(params, images=None, points=None, bboxes=None):
+        """Inverse of rotation: rotate by -angle, crop/pad to original size.
+        
+        Args:
+            params: dict with rotation parameters.
+            images: optional list of images to inverse-transform.
+            points: optional list of (N, 2) arrays of (x, y) points.
+            bboxes: optional list of (N, 4+) arrays of bboxes.
+        
+        Returns:
+            dict with keys 'images', 'points', 'bboxes' for those that were provided.
+        """
+        result = {}
+        angle = params['angle']
+        expand = params['expand']
+        center = params['center']
+        org_im_size = params['org_im_size']
+        new_im_size = params['new_im_size']
+
+        if images:
+            out_images = []
+            for img in images:
+                if isinstance(img, torch.Tensor) and len(img.shape) == 2:
+                    img = F.rotate(img.unsqueeze(0), -angle, InterpolationMode.BILINEAR, expand, center)[0]
+                else:
+                    img = F.rotate(img, -angle, InterpolationMode.BILINEAR, expand, center)
+
+                if expand and org_im_size is not None:
+                    cur_w, cur_h = get_image_size(img)
+                    target_w, target_h = org_im_size
+                    left = (cur_w - target_w) // 2
+                    top = (cur_h - target_h) // 2
+                    if isinstance(img, torch.Tensor) and len(img.shape) == 2:
+                        img = F.crop(img.unsqueeze(0), top, left, target_h, target_w)[0]
+                    else:
+                        img = F.crop(img, top, left, target_h, target_w)
+                out_images.append(img)
+            result['images'] = out_images
+
+        if points:
+            out_points = []
+            if org_im_size is not None:
+                new_center = (new_im_size[0] / 2, new_im_size[1] / 2) if expand else \
+                             ((org_im_size[0] / 2, org_im_size[1] / 2) if center is None else center)
+                old_center = (org_im_size[0] / 2, org_im_size[1] / 2) if center is None else center
+                angle_rad = -angle * np.pi / 180
+                rot_mat = np.array([[np.cos(angle_rad), -np.sin(angle_rad)],
+                                    [np.sin(angle_rad), np.cos(angle_rad)]], dtype=np.float64)
+            for pts in points:
+                pts = np.array(pts, dtype=np.float64)
+                if org_im_size is not None:
+                    pts[:, 0] -= new_center[0]
+                    pts[:, 1] -= new_center[1]
+                    pts = np.matmul(rot_mat, pts.T).T
+                    pts[:, 0] += old_center[0]
+                    pts[:, 1] += old_center[1]
+                out_points.append(pts)
+            result['points'] = out_points
+
+        if bboxes:
+            out_bboxes = []
+            if org_im_size is not None:
+                new_center = (new_im_size[0] / 2, new_im_size[1] / 2) if expand else \
+                             ((org_im_size[0] / 2, org_im_size[1] / 2) if center is None else center)
+                old_center = (org_im_size[0] / 2, org_im_size[1] / 2) if center is None else center
+                angle_rad = -angle * np.pi / 180
+                rot_mat = np.array([[np.cos(angle_rad), -np.sin(angle_rad)],
+                                    [np.sin(angle_rad), np.cos(angle_rad)]], dtype=np.float64)
+            for bbs in bboxes:
+                bbs = np.array(bbs, dtype=np.float64)
+                if bbs.size > 0 and org_im_size is not None:
+                    i_col, j_col = 0, 1
+                    if bbs.shape[1] % 2 == 1:
+                        i_col, j_col = 1, 2
+                    coords = bbs[:, i_col:].reshape(-1, 2)
+                    coords[:, 0] -= new_center[0]
+                    coords[:, 1] -= new_center[1]
+                    coords = np.matmul(rot_mat, coords.T).T
+                    coords[:, 0] += old_center[0]
+                    coords[:, 1] += old_center[1]
+                    bbs[:, i_col:] = coords.reshape(bbs[:, i_col:].shape)
+                out_bboxes.append(bbs)
+            result['bboxes'] = out_bboxes
+
+        return result
 
     def __repr__(self):
         format_string = self.__class__.__name__ + '(angles={0}'.format(self.angles)
@@ -361,7 +654,7 @@ class RandomRotation(T.RandomRotation):
 
         self.keys = keys
 
-        if isinstance(self.resample, collections.Iterable):
+        if isinstance(self.resample, Iterable):
             assert(len(keys) == len(self.resample))
 
     @staticmethod
@@ -381,12 +674,15 @@ class RandomRotation(T.RandomRotation):
 
         angle = self.get_params(self.degrees, rng)
 
+        if len(self.keys) > 0:
+            org_im_size = get_image_size(sample[self.keys[0]])
+
         for idx, k in enumerate(self.keys):
 
             assert(k in sample)
 
             resample = self.resample
-            if isinstance(resample, collections.Iterable):
+            if isinstance(resample, Iterable):
                 resample = resample[idx]
 
             if type(sample[k]) == torch.Tensor and len(sample[k].shape) == 2:
@@ -394,7 +690,27 @@ class RandomRotation(T.RandomRotation):
             else:
                 sample[k] = F.rotate(sample[k], angle, resample, self.expand, self.center)
 
+        if len(self.keys) > 0:
+            new_im_size = get_image_size(sample[self.keys[0]])
+        else:
+            new_im_size = None
+            org_im_size = None
+
+        if angle != 0:
+            _record_transform(sample, 'RandomRotation', {
+                'angle': float(angle),
+                'expand': self.expand,
+                'center': self.center,
+                'org_im_size': org_im_size,
+                'new_im_size': new_im_size,
+            })
+
         return sample
+
+    @staticmethod
+    def inverse(params, images=None, points=None, bboxes=None):
+        """Inverse of rotation: delegates to RandomCustomRotation.inverse()."""
+        return RandomCustomRotation.inverse(params, images=images, points=points, bboxes=bboxes)
 
 
 class RandomHorizontalFlip(T.RandomHorizontalFlip):
@@ -435,12 +751,66 @@ class RandomHorizontalFlip(T.RandomHorizontalFlip):
                     sample[k][idx, i] = im_size[0] - sample[k][idx, i]
                     if sample[k].shape[1] > i+2:
                         sample[k][idx, i] -= sample[k][idx, i+2]
-            
+
             if self.keys_custom_fn is not None:
                 for k,fn in self.keys_custom_fn.items():
                     sample[k] = fn(sample[k])
-                
+
+            # Record that flip was applied
+            if len(self.keys) > 0:
+                im_size = get_image_size(sample[self.keys[0]])
+            _record_transform(sample, 'RandomHorizontalFlip', {
+                'im_w': im_size[0], 'im_h': im_size[1],
+            })
+
         return sample
+
+    @staticmethod
+    def inverse(params, images=None, points=None, bboxes=None):
+        """Inverse of horizontal flip.
+        
+        Args:
+            params: dict with flip parameters.
+            images: optional list of images to inverse-transform.
+            points: optional list of (N, 2) arrays of (x, y) points.
+            bboxes: optional list of (N, 4+) arrays of bboxes.
+        
+        Returns:
+            dict with keys 'images', 'points', 'bboxes' for those that were provided.
+        """
+        result = {}
+
+        if images:
+            out_images = []
+            for img in images:
+                if isinstance(img, torch.Tensor) and len(img.shape) == 2:
+                    img = F.hflip(img.unsqueeze(0))[0]
+                else:
+                    img = F.hflip(img)
+                out_images.append(img)
+            result['images'] = out_images
+
+        if points:
+            out_points = []
+            for pts in points:
+                pts = np.array(pts, dtype=np.float64)
+                pts[:, 0] = params['im_w'] - pts[:, 0]
+                out_points.append(pts)
+            result['points'] = out_points
+
+        if bboxes:
+            out_bboxes = []
+            for bbs in bboxes:
+                bbs = np.array(bbs, dtype=np.float64)
+                if bbs.size > 0:
+                    i_col = 0
+                    if bbs.shape[1] % 2 == 1:
+                        i_col = 1
+                    bbs[:, i_col] = params['im_w'] - bbs[:, i_col]
+                out_bboxes.append(bbs)
+            result['bboxes'] = out_bboxes
+
+        return result
 
 class RandomVerticalFlip(T.RandomVerticalFlip):
 
@@ -480,22 +850,78 @@ class RandomVerticalFlip(T.RandomVerticalFlip):
                     sample[k][idx, j] = im_size[1] - sample[k][idx, j]
                     if sample[k].shape[1] > j+2:
                         sample[k][idx, j] -= sample[k][idx, j+2]
-            
+
             if self.keys_custom_fn is not None:
                 for k,fn in self.keys_custom_fn.items():
                     sample[k] = fn(sample[k])
+
+            # Record that flip was applied
+            if len(self.keys) > 0:
+                im_size = get_image_size(sample[self.keys[0]])
+            _record_transform(sample, 'RandomVerticalFlip', {
+                'im_w': im_size[0], 'im_h': im_size[1],
+            })
+
         return sample
+
+    @staticmethod
+    def inverse(params, images=None, points=None, bboxes=None):
+        """Inverse of vertical flip.
+        
+        Args:
+            params: dict with flip parameters.
+            images: optional list of images to inverse-transform.
+            points: optional list of (N, 2) arrays of (x, y) points.
+            bboxes: optional list of (N, 4+) arrays of bboxes.
+        
+        Returns:
+            dict with keys 'images', 'points', 'bboxes' for those that were provided.
+        """
+        result = {}
+
+        if images:
+            out_images = []
+            for img in images:
+                if isinstance(img, torch.Tensor) and len(img.shape) == 2:
+                    img = F.vflip(img.unsqueeze(0))[0]
+                else:
+                    img = F.vflip(img)
+                out_images.append(img)
+            result['images'] = out_images
+
+        if points:
+            out_points = []
+            for pts in points:
+                pts = np.array(pts, dtype=np.float64)
+                pts[:, 1] = params['im_h'] - pts[:, 1]
+                out_points.append(pts)
+            result['points'] = out_points
+
+        if bboxes:
+            out_bboxes = []
+            for bbs in bboxes:
+                bbs = np.array(bbs, dtype=np.float64)
+                if bbs.size > 0:
+                    j_col = 1
+                    if bbs.shape[1] % 2 == 1:
+                        j_col = 2
+                    bbs[:, j_col] = params['im_h'] - bbs[:, j_col]
+                out_bboxes.append(bbs)
+            result['bboxes'] = out_bboxes
+
+        return result
 
 class RandomResize(object):
 
-    def __init__(self, scale_range, keys=[], keys_bbox=[], keys_camK=[], interpolation=Image.BILINEAR, *args, **kwargs):
+    def __init__(self, scale_range, keys=[], keys_bbox=[], keys_camK=[], keys_custom_fn=dict(), interpolation=Image.BILINEAR, *args, **kwargs):
         self.scale_range = scale_range
         self.keys = keys
         self.keys_bbox = keys_bbox
-        self.keys_camK = keys_camK        
+        self.keys_camK = keys_camK
+        self.keys_custom_fn = keys_custom_fn
         self.interpolation = interpolation
 
-        if isinstance(self.interpolation, collections.Iterable):
+        if isinstance(self.interpolation, Iterable):
             assert(len(keys) == len(self.interpolation))
 
     @staticmethod
@@ -524,7 +950,7 @@ class RandomResize(object):
             assert(k in sample)
 
             interpolation = self.interpolation
-            if isinstance(interpolation, collections.Iterable):
+            if isinstance(interpolation, Iterable):
                 interpolation = interpolation[idx]
 
             new_size = int(get_image_size(sample[k])[1]*resize_factor), int(get_image_size(sample[k])[0]*resize_factor)
@@ -556,8 +982,16 @@ class RandomResize(object):
                 if sample[k].shape[1] > j+2:
                     sample[k][idx, i+2] *= real_resize_factor[0]
                     sample[k][idx, j+2] *= real_resize_factor[1]
-        
-        # adjustment of camera calibration matrix 
+
+        if self.keys_custom_fn is not None:
+            if len(self.keys) > 0:
+                new_im_size = get_image_size(sample[self.keys[0]])
+            assert org_im_size
+            assert new_im_size
+            for k,fn in self.keys_custom_fn.items():
+                sample[k] = fn(sample[k], org_im_size, new_im_size)
+
+        # adjustment of camera calibration matrix
         if len(self.keys_camK) > 0:
             if len(self.keys) > 0:
                 new_im_size = get_image_size(sample[self.keys[0]])
@@ -568,25 +1002,89 @@ class RandomResize(object):
             for k in self.keys_camK:
                 if k not in sample:
                     continue
-                
+
                 sample[k][0,:] *= real_resize_factor[0]
                 sample[k][1,:] *= real_resize_factor[1]
 
+        # Record transform for inverse
+        if len(self.keys) > 0:
+            new_im_size = get_image_size(sample[self.keys[0]])
+            _record_transform(sample, 'RandomResize', {
+                'org_im_size': org_im_size,  # (w, h)
+                'new_im_size': new_im_size,  # (w, h)
+            })
 
         return sample
 
+    @staticmethod
+    def inverse(params, images=None, points=None, bboxes=None):
+        """Inverse of resize: scale back to original dimensions.
+        
+        Args:
+            params: dict with resize parameters.
+            images: optional list of images to inverse-transform.
+            points: optional list of (N, 2) arrays of (x, y) points.
+            bboxes: optional list of (N, 4+) arrays of bboxes.
+        
+        Returns:
+            dict with keys 'images', 'points', 'bboxes' for those that were provided.
+        """
+        result = {}
+        org_w, org_h = params['org_im_size']
+        new_w, new_h = params['new_im_size']
+        target_size = (org_h, org_w)  # F.resize expects (h, w)
+        scale_x = org_w / new_w
+        scale_y = org_h / new_h
+
+        if images:
+            out_images = []
+            for img in images:
+                if isinstance(img, torch.Tensor) and len(img.shape) == 2:
+                    img = F.resize(img.unsqueeze(0), target_size, InterpolationMode.BILINEAR, antialias=None)[0]
+                else:
+                    img = F.resize(img, target_size, InterpolationMode.BILINEAR, antialias=None)
+                out_images.append(img)
+            result['images'] = out_images
+
+        if points:
+            out_points = []
+            for pts in points:
+                pts = np.array(pts, dtype=np.float64)
+                pts[:, 0] *= scale_x
+                pts[:, 1] *= scale_y
+                out_points.append(pts)
+            result['points'] = out_points
+
+        if bboxes:
+            out_bboxes = []
+            for bbs in bboxes:
+                bbs = np.array(bbs, dtype=np.float64)
+                if bbs.size > 0:
+                    i_col, j_col = 0, 1
+                    if bbs.shape[1] % 2 == 1:
+                        i_col, j_col = 1, 2
+                    bbs[:, i_col] *= scale_x
+                    bbs[:, j_col] *= scale_y
+                    if bbs.shape[1] > j_col + 2:
+                        bbs[:, i_col + 2] *= scale_x
+                        bbs[:, j_col + 2] *= scale_y
+                out_bboxes.append(bbs)
+            result['bboxes'] = out_bboxes
+
+        return result
 
 
 class Resize(T.Resize):
 
-    def __init__(self, keys=[], keys_bbox=[], keys_camK=[], *args, **kwargs):
+    def __init__(self, keys=[], keys_bbox=[], keys_camK=[], keys_custom_fn=dict(), *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.keys = keys
         self.keys_bbox = keys_bbox
         self.keys_camK = keys_camK
+        self.keys_custom_fn = keys_custom_fn
 
-        if isinstance(self.interpolation, collections.Iterable):
+        if isinstance(self.interpolation, Iterable):
             assert(len(keys) == len(self.interpolation))
 
     def __call__(self, sample, *args):
@@ -599,13 +1097,17 @@ class Resize(T.Resize):
             assert(k in sample)
 
             interpolation = self.interpolation
-            if isinstance(interpolation, collections.Iterable):
+            if isinstance(interpolation, Iterable):
                 interpolation = interpolation[idx]
 
             if type(sample[k]) == torch.Tensor and len(sample[k].shape) == 2:
                 sample[k] = F.resize(sample[k].unsqueeze(0), self.size, interpolation, antialias=None)[0]
             else:
                 sample[k] = F.resize(sample[k], self.size, interpolation, antialias=None)
+
+        if self.keys_custom_fn is not None:
+            for k,fn in self.keys_custom_fn.items():
+                sample[k] = fn(sample[k], org_im_size, self.size)
 
         if len(self.keys_bbox) > 0:
             assert org_im_size
@@ -628,21 +1130,85 @@ class Resize(T.Resize):
                     sample[k][idx, i+2] *= resize_factor[0]
                     sample[k][idx, j+2] *= resize_factor[1]
 
-        # adjustment of camera calibration matrix 
+        # adjustment of camera calibration matrix
         if len(self.keys_camK) > 0:
-            
+
             resize_factor = self.size[1]/org_im_size[0], self.size[0]/org_im_size[1]
 
             for k in self.keys_camK:
                 if k not in sample:
                     continue
-                
+
                 sample[k][0,:] *= resize_factor[0]
                 sample[k][1,:] *= resize_factor[1]
 
-
+        # Record transform for inverse
+        if len(self.keys) > 0:
+            new_im_size = get_image_size(sample[self.keys[0]])
+            _record_transform(sample, 'Resize', {
+                'org_im_size': org_im_size,  # (w, h)
+                'new_im_size': new_im_size,  # (w, h)
+                'target_size': tuple(self.size),
+            })
 
         return sample
+
+    @staticmethod
+    def inverse(params, images=None, points=None, bboxes=None):
+        """Inverse of resize: scale back to original dimensions.
+        
+        Args:
+            params: dict with resize parameters.
+            images: optional list of images to inverse-transform.
+            points: optional list of (N, 2) arrays of (x, y) points.
+            bboxes: optional list of (N, 4+) arrays of bboxes.
+        
+        Returns:
+            dict with keys 'images', 'points', 'bboxes' for those that were provided.
+        """
+        result = {}
+        org_w, org_h = params['org_im_size']
+        new_w, new_h = params['new_im_size']
+        target_size = (org_h, org_w)
+        scale_x = org_w / new_w
+        scale_y = org_h / new_h
+
+        if images:
+            out_images = []
+            for img in images:
+                if isinstance(img, torch.Tensor) and len(img.shape) == 2:
+                    img = F.resize(img.unsqueeze(0), target_size, InterpolationMode.BILINEAR, antialias=None)[0]
+                else:
+                    img = F.resize(img, target_size, InterpolationMode.BILINEAR, antialias=None)
+                out_images.append(img)
+            result['images'] = out_images
+
+        if points:
+            out_points = []
+            for pts in points:
+                pts = np.array(pts, dtype=np.float64)
+                pts[:, 0] *= scale_x
+                pts[:, 1] *= scale_y
+                out_points.append(pts)
+            result['points'] = out_points
+
+        if bboxes:
+            out_bboxes = []
+            for bbs in bboxes:
+                bbs = np.array(bbs, dtype=np.float64)
+                if bbs.size > 0:
+                    i_col, j_col = 0, 1
+                    if bbs.shape[1] % 2 == 1:
+                        i_col, j_col = 1, 2
+                    bbs[:, i_col] *= scale_x
+                    bbs[:, j_col] *= scale_y
+                    if bbs.shape[1] > j_col + 2:
+                        bbs[:, i_col + 2] *= scale_x
+                        bbs[:, j_col + 2] *= scale_y
+                out_bboxes.append(bbs)
+            result['bboxes'] = out_bboxes
+
+        return result
 
 
 class ColorJitter(T.ColorJitter):
@@ -713,11 +1279,11 @@ class RandomGaussianNoise(object):
             noise = None
             for idx, k in enumerate(self.keys):
                 assert(k in sample)
-                
+
                 if noise is  None:
                     mean = rng.uniform(self.mean[0], self.mean[1]) if type(self.mean) in [list,tuple] else self.mean
                     std = rng.uniform(self.std[0], self.std[1]) if type(self.std) in [list,tuple] else self.std
-                    
+
                     noise = np.random.normal(mean, std, sample[k].shape).astype(np.float32)
 
                 sample[k] = sample[k] + noise
@@ -824,13 +1390,85 @@ class Padding(object):
             sample[k][idx, i] += pad_size[0]
             sample[k][idx, j] += pad_size[1]
 
+        if pad_size is not None:
+            sample['Padding'] = np.array(pad_size).reshape(-1,4)
+
+            _record_transform(sample, 'Padding', {
+                'pad_left': pad_size[0],
+                'pad_top': pad_size[1],
+                'pad_right': pad_size[2],
+                'pad_bottom': pad_size[3],
+            })
+
         return sample
+
+    @staticmethod
+    def inverse(params, images=None, points=None, bboxes=None):
+        """Inverse of padding: crop away the padded borders.
+        
+        Args:
+            params: dict with padding parameters.
+            images: optional list of images to inverse-transform.
+            points: optional list of (N, 2) arrays of (x, y) points.
+            bboxes: optional list of (N, 4+) arrays of bboxes.
+        
+        Returns:
+            dict with keys 'images', 'points', 'bboxes' for those that were provided.
+        """
+        result = {}
+        pl = params['pad_left']
+        pt = params['pad_top']
+        pr = params['pad_right']
+        pb = params['pad_bottom']
+
+        if images:
+            out_images = []
+            for img in images:
+                if isinstance(img, torch.Tensor):
+                    if len(img.shape) == 2:
+                        h, w = img.shape
+                        img = img[pt:h - pb if pb > 0 else h, pl:w - pr if pr > 0 else w]
+                    else:
+                        h, w = img.shape[-2], img.shape[-1]
+                        img = img[..., pt:h - pb if pb > 0 else h, pl:w - pr if pr > 0 else w]
+                elif isinstance(img, np.ndarray):
+                    h, w = img.shape[0], img.shape[1]
+                    img = img[pt:h - pb if pb > 0 else h, pl:w - pr if pr > 0 else w]
+                elif isinstance(img, Image.Image):
+                    w, h = img.size
+                    img = img.crop((pl, pt, w - pr if pr > 0 else w, h - pb if pb > 0 else h))
+                out_images.append(img)
+            result['images'] = out_images
+
+        if points:
+            out_points = []
+            for pts in points:
+                pts = np.array(pts, dtype=np.float64)
+                pts[:, 0] -= pl
+                pts[:, 1] -= pt
+                out_points.append(pts)
+            result['points'] = out_points
+
+        if bboxes:
+            out_bboxes = []
+            for bbs in bboxes:
+                bbs = np.array(bbs, dtype=np.float64)
+                if bbs.size > 0:
+                    i_col, j_col = 0, 1
+                    if bbs.shape[1] % 2 == 1:
+                        i_col, j_col = 1, 2
+                    bbs[:, i_col] -= pl
+                    bbs[:, j_col] -= pt
+                out_bboxes.append(bbs)
+            result['bboxes'] = out_bboxes
+
+        return result
 
 class ToTensor(object):
 
     def __init__(self, keys=[], type="float"):
 
-        if isinstance(type, collections.Iterable):
+        if isinstance(type, Iterable):
             assert(len(keys) == len(type))
 
         self.keys = keys
@@ -843,7 +1481,7 @@ class ToTensor(object):
             assert(k in sample)
 
             t = self.type
-            if isinstance(t, collections.Iterable):
+            if isinstance(t, Iterable):
                 t = t[idx]
 
             if isinstance(sample[k],Image.Image) or isinstance(sample[k],np.ndarray):
@@ -908,13 +1546,13 @@ class Normalize(object):
 
     def __init__(self, keys=[], mean=[], std=[], shape=[]):
 
-        if isinstance(type, collections.Iterable):
+        if isinstance(type, Iterable):
             assert(len(keys) == len(mean))
 
-        if isinstance(type, collections.Iterable):
+        if isinstance(type, Iterable):
             assert(len(keys) == len(std))
 
-        if isinstance(type, collections.Iterable):
+        if isinstance(type, Iterable):
             assert(len(keys) == len(shape))
 
 
@@ -930,15 +1568,15 @@ class Normalize(object):
             assert(k in sample)
 
             m = self.mean
-            if isinstance(m, collections.Iterable):
+            if isinstance(m, Iterable):
                 m = m[idx]
 
             s = self.std
-            if isinstance(s, collections.Iterable):
+            if isinstance(s, Iterable):
                 s = s[idx]
 
             sh = self.shape
-            if isinstance(sh, collections.Iterable):
+            if isinstance(sh, Iterable):
                 sh = sh[idx]
 
             sample[k] = (sample[k]  - m.reshape(sh) ) / s.reshape(sh)
@@ -983,7 +1621,7 @@ class Background(object):
         with open(bg_images) as f:
             lines = f.readlines()
             for l in lines:
-                s = l.strip().split(' ')                
+                s = l.strip().split(' ')
                 ok = (int(s[-1])==1) if len(s) > 1 else True
                 if ok:
                     fn = os.path.join(bg_dir,f"{s[0]}{img_ext}")
@@ -1016,14 +1654,14 @@ class Background(object):
                     to_output_format = lambda x: (F.to_tensor(x)*255).type(torch.ByteTensor)
 
                 im = (im*255).permute([1, 2, 0]).numpy()
-                
+
             elif isinstance(im,Image.Image):
                 to_output_format = Image.fromarray
 
             im = np.array(im)
 
             im_shape = im.shape[:2][::-1]
-    
+
             # get bg
             if bg is None:
                 bg = cv2.imread(bg_fn)
@@ -1047,3 +1685,97 @@ def get_transform(transforms):
         transform_list.append(globals()[name](**opts))
 
     return Compose(transform_list)
+
+
+def _record_transform(sample, name, params):
+    """Record a transform and its parameters into sample['transforms'].
+    
+    Stored as a JSON string so that variable_len_collate (which cannot handle
+    nested dicts containing None) treats it as a plain string and passes it
+    through untouched.
+    
+    Each entry in the JSON list contains:
+        - 'name': class name of the transform
+        - 'params': dict of parameters needed to compute the inverse
+    """
+    # Decode existing history
+    history = []
+    if 'transforms' in sample and sample['transforms']:
+        assert isinstance(sample['transforms'], str), f"Expected 'transforms' to be a JSON string."
+
+        history = json.loads(sample['transforms'])
+
+
+    history.append({'name': name, 'params': params})
+
+    # Store as JSON string (collation-safe)
+    sample['transforms'] = json.dumps(history)
+
+
+# Registry mapping transform name -> class (populated at module end)
+
+# Add inverse method for FixedCrop and CenterCrop (they inherit from RandomCrop,
+# so their inverse logic is identical)
+FixedCrop.inverse = staticmethod(RandomCrop.inverse)
+CenterCrop.inverse = staticmethod(RandomCrop.inverse)
+
+# Populate the transform registry for inverse lookup
+_TRANSFORM_REGISTRY= {
+    'CropRandomObject': CropRandomObject,
+    'RandomCrop': RandomCrop,
+    'FixedCrop': FixedCrop,
+    'CenterCrop': CenterCrop,
+    'RandomCustomRotation': RandomCustomRotation,
+    'RandomRotation': RandomRotation,
+    'RandomHorizontalFlip': RandomHorizontalFlip,
+    'RandomVerticalFlip': RandomVerticalFlip,
+    'RandomResize': RandomResize,
+    'Resize': Resize,
+    'Padding': Padding,
+}
+
+def inverse_transform(sample, images=None, points=None, bboxes=None):
+    """Apply inverse of all recorded transforms in reverse order.
+    
+    Args:
+        sample: dict containing 'transforms' key with recorded transform history.
+        images: list of image arrays/tensors to inverse-transform (H,W or C,H,W).
+        points: list of point arrays, each shaped (N, 2) as (x, y).
+        bboxes: list of bbox arrays, each shaped (N, 4+) where columns are
+                [x, y, ...] or [id, x, y, ...] (odd column count means first col is id).
+    
+    Returns:
+        dict with keys 'images', 'points', 'bboxes' containing inverse-transformed lists.
+    """
+    data = dict(
+        images=images,
+        points=points,
+        bboxes=bboxes
+    )
+
+    transforms_raw = sample.get('transforms', None)
+    if not transforms_raw:
+        return data
+
+    # should always be single batch
+    transforms_raw = transforms_raw[0]
+
+    # Decode: JSON string (normal path) or legacy dict/list format.
+    # After collation + extract_batch, transforms_raw may be a list with
+    # one JSON string element, e.g. ['[{"name": ...}]'].
+    assert isinstance(transforms_raw, str), f"Expected 'transforms' to be a JSON string, got {type(transforms_raw)}."
+
+    transforms_history = json.loads(transforms_raw)
+
+    # Apply in reverse order
+    for entry in reversed(transforms_history):
+        name = entry['name']
+        params = entry['params']
+
+        cls = _TRANSFORM_REGISTRY.get(name)
+        if cls is None:
+            raise ValueError(f"Unknown transform '{name}' — cannot compute inverse.")
+
+        data = cls.inverse(params, **data)
+
+    return data

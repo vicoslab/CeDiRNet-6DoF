@@ -1,7 +1,12 @@
+"""
+Author: Davy Neven
+Licensed under the CC BY-NC 4.0 license (https://creativecommons.org/licenses/by-nc/4.0/)
+"""
 import torch
 import torch.nn as nn
 import segmentation_models_pytorch as smp
 import torch.nn.functional as F
+import copy
 
 import numpy as np
 
@@ -11,55 +16,58 @@ from typing import Iterator
 import itertools
 
 class FPN(nn.Module, MultiTaskModel):
-    def __init__(self, num_classes, backbone='resnet34', use_depth=False, use_custom_fpn=False, add_output_exp=False, init_decoder_gain=0.1, fpn_args={}, pretrained=True, in_channels=None, use_only_depth=True):
+    def __init__(self, num_classes, backbone='resnet34', use_depth=False, use_custom_fpn=False, add_output_exp=False, init_decoder_gain=0.1, fpn_args={}, pretrained=True, in_channels=None, use_only_depth=True, preprocess_args=None):
         super().__init__()
 
         self.use_custom_fpn = use_custom_fpn
         print('Creating FPN segmentation with {} classes'.format(num_classes))
+
+        # make a copy of fpn_args so that we do not modify original array
+        fpn_args = copy.deepcopy(fpn_args)
+
         if 'encoder_depth' not in fpn_args:
             fpn_args['encoder_depth'] = 4
         if 'upsampling' not in fpn_args:
             fpn_args['upsampling'] = 2
 
         self.use_only_depth = use_only_depth
-
-        if use_depth:
-            if not use_only_depth:
-                self.depth_mean = fpn_args['depth_mean']
-                self.depth_std = fpn_args['depth_std']
-        fpn_args.pop('depth_mean')
-        fpn_args.pop('depth_std')
-            # else:
-
-        
-
         self.use_depth = use_depth
         self.in_channels = in_channels if in_channels is not None else (4 if use_depth else 3)
+
+        self.preprocess_params = smp.encoders.get_preprocessing_params(backbone, pretrained="imagenet")
+        if use_depth:
+            depth_mean = fpn_args['depth_mean']
+            depth_std = fpn_args['depth_std']
+
+            depth_mean = [depth_mean] if type(depth_mean)==int or type(depth_mean)==float else depth_mean
+            depth_std = [depth_std] if type(depth_std)==int or type(depth_std)==float else depth_std
+
+            if not use_only_depth:
+                self.preprocess_params['mean'].extend(depth_mean)
+                self.preprocess_params['std'].extend(depth_std)
+            else:
+                self.preprocess_params['mean'] = depth_mean
+                self.preprocess_params['std'] = depth_std
+
+            # update input_range to exlcude depth from beig multipled by 255
+            assert self.in_channels >= 4, f"ERROR: expecting 3 channel RGB + n>=1 DEPTH channels, but got only {self.in_channels} channels in total."
+
+            self.preprocess_params['input_range'] = [[self.preprocess_params['input_range'][0]]*3 + (self.in_channels-3)*[-np.inf],
+                                                     [self.preprocess_params['input_range'][1]]*3 + (self.in_channels-3)*[np.inf]]
+
+
+        if preprocess_args is not None:
+            self.preprocess_params.update(preprocess_args)
+
+        # make sure to remove depth_mean and depth_std from fpn_args if they are present before creating the model
+        if 'depth_mean' in fpn_args: fpn_args.pop('depth_mean')
+        if 'depth_std' in fpn_args: fpn_args.pop('depth_std')
 
         if self.use_custom_fpn:
             self.model = Custom_FPN(backbone, classes=sum(num_classes), activation=None, in_channels=self.in_channels, decoder_merge_policy='add', encoder_weights='imagenet' if pretrained else None, **fpn_args)
         else:
             self.model = smp.FPN(backbone, classes=sum(num_classes), activation=None,
                                  decoder_merge_policy='add', encoder_weights='imagenet' if pretrained else None, **fpn_args)
-
-        self.preprocess_params = smp.encoders.get_preprocessing_params(backbone, pretrained="imagenet")
-        if use_depth:
-            if not use_only_depth:
-                if type(self.depth_mean)==int or type(self.depth_mean)==float: # if one number, add to mean and std vectors
-                    self.preprocess_params['mean'].append(self.depth_mean)
-                    self.preprocess_params['std'].append(self.depth_std)
-                else: # if list, extend the vectors
-                    self.preprocess_params['mean'].extend(self.depth_mean)
-                    self.preprocess_params['std'].extend(self.depth_std)
-            else:
-                # self.preprocess_params['mean'] = [0,0,0]
-                # self.preprocess_params['std'] = [1,1,1]
-                self.preprocess_params['mean'] = [0]
-                self.preprocess_params['std'] = [1]
-
-        # print("use_depth", use_depth)
-        # print("use_only_depth", use_only_depth)
-        # print(self.preprocess_params['mean'])
 
         self.add_output_exp = add_output_exp
         self.init_decoder_gain = init_decoder_gain
@@ -160,6 +168,31 @@ def _find_last_conv_index(sequence):
     return max([i for i, layer in enumerate(sequence)
                                if type(layer) in [nn.Conv2d, nn.ConvTranspose2d, nn.Linear, nn.Conv1d,
                                                   nn.ConvTranspose1d, nn.Conv3d, nn.ConvTranspose3d]])
+
+
+class MyFPN(nn.Module):
+    def __init__(self, num_classes, backbone='resnet34'):
+        super().__init__()
+
+        print('Creating FPN segmentation with {} classes'.format(num_classes))
+        self.model = Custom_FPN(backbone, classes=sum(num_classes), activation=None,
+                                decoder_merge_policy='add', encoder_weights='imagenet')
+
+    def init_output(self, num_vector_fields=1):
+        with torch.no_grad():
+            output_conv = self.model.segmentation_head[-2]
+            print('initialize last layer with size: ',
+                  output_conv.weight.size())
+
+            output_conv.weight[0:num_vector_fields, :, :, :].fill_(0)
+            output_conv.bias[0:num_vector_fields].fill_(0)
+
+            output_conv.weight[num_vector_fields:, :, :, :].fill_(0)
+            output_conv.bias[num_vector_fields:].fill_(1)
+
+    def forward(self, input, only_encode=False):
+        return self.model.forward(input)
+
 
 from typing import Optional, Union
 try:
@@ -453,13 +486,31 @@ class SegmentationHead(nn.Sequential):
 def preprocess_input(
     x, mean=None, std=None, input_space="RGB", input_range=None, **kwargs
 ):
-
+    ch_index = 1 if len(x.shape) == 4 else 0
     if input_space == "BGR":
+        assert x.shape[ch_index] == 3, "Input tensor must have 3 channels for BGR conversion"
+        # Convert BGR to RGB by reversing the order of the first three channels
         x = x[..., ::-1].copy()
 
     if input_range is not None:
-        if x.max() > 1 and input_range[1] == 1:
-            x = x / 255.0
+        # convert to per-channel input range if it is not already
+        if not isinstance(input_range[0], (list, tuple)): input_range[0] = [input_range[0]] * x.shape[ch_index]
+        if not isinstance(input_range[1], (list, tuple)): input_range[1] = [input_range[1]] * x.shape[ch_index]
+
+        assert len(input_range[0]) == x.shape[ch_index], "Input range for min must match number of channels in input tensor"
+        assert len(input_range[1]) == x.shape[ch_index], "Input range for max must match number of channels in input tensor"
+
+        # Per-channel normalization (convert to BCHW if in CHW format )
+        if ch_index == 0:
+            x = x[None, :]
+
+        for c in range(x.shape[1]):
+            if x[:, c].max() > 1 and input_range[1][c] == 1:
+                x[:, c] /= 255.0
+
+        if ch_index == 0:
+            x = x.squeeze(0)
+
 
     if mean is not None:
         mean = torch.tensor(mean)

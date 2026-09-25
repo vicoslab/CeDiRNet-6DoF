@@ -27,14 +27,17 @@ class CenterDirGroundtruthDataset(Dataset, LockableSeedRandomAccess):
     def __getitem__(self, index):
         sample = self.dataset[index]
 
-        instance = sample['instance']
+        # DISABLE THIS - we do not support caching of centerdir_groundtruth any more
+        if False:
+            instance = sample['instance']
+            filename = os.path.basename(sample['im_name'])
 
-        # init data strucutre for groundtruth
-        centerdir_groundtruth, output = self.centerdir_groundtruth_op._init_datastructure(instance.shape[-2], instance.shape[-1])
+            # load cache data from filename
+            centerdir_groundtruth, output = self.centerdir_groundtruth_op._load_from_cache(filename, instance.shape[-2], instance.shape[-1])
 
-        # store cached data into sample
-        if output is not None:
-            sample['output'] = output
-        sample['centerdir_groundtruth'] = centerdir_groundtruth
+            # store cached data into sample
+            if output is not None:
+                sample['output'] = output
+            sample['centerdir_groundtruth'] = centerdir_groundtruth
 
         return sample

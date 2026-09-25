@@ -53,7 +53,7 @@ class CenterAugmentator(nn.Module):
             gt_seed = [None] * len(gt_instance)
 
         #gt_instance = gt_instance.to(input.device)
-        gt_centers = gt_centerdir[2]
+        gt_centers = gt_centerdir['gt_centers']
 
         for b in range(len(gt_instance)):
             # save random seed if not present

@@ -3,8 +3,9 @@ import ast
 import importlib
 import copy
 
-dataset_to_import = {'mujoco':'mujoco.{subname}.{type}',
-                     'vicos_towel':'vicos_towel.{subname}.{type}'}
+dataset_to_import = {
+    'cloth_6dof': 'cloth_6dof.{type}',
+}
 
 def get_cmd_args():
     class ParseConfigCMDArgs(argparse.Action):
@@ -77,7 +78,7 @@ def merge_args_from_config(args, cmd_args):
         print("Overriding config with cmd %s=%s" % (k,v))
 
     return args
-    
+
 def replace_args(_args, full_args=None):
     if full_args is None:
         full_args = copy.deepcopy(_args)

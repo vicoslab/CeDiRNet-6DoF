@@ -5,6 +5,7 @@ from tqdm import tqdm
 import numpy as np
 
 import torch
+import torch.nn.functional as F
 
 from models.center_groundtruth import CenterDirGroundtruth
 
@@ -17,11 +18,11 @@ class CenterDirProcesser:
 
     Class is able to handle the following items in the input data (sample from the dataset):
       - required keys: image, im_name, instance,
-      - optional keys: centerdir_groundtruth, ignore, center
+      - optional keys: centerdir_groundtruth, ignore, center, grid_index,
 
     The following keys are emitted for each processed/merged image:
       - as reference input data:  <ANY ORIGINAL SAMPLE DATA such as image, im_name, instance, center, centerdir_groundtruth, ignore etc. > + center_dict
-      - as processed output data: output, predictions,pred_heatmap
+      - as processed output data: output, output_cls, resnet_features, CAM, predictions, pred_mask, pred_heatmap
     '''
     def __init__(self, model, center_model_list, device=None):
         self.model = model
@@ -32,6 +33,122 @@ class CenterDirProcesser:
 
     def get_center_model_list(self):
         return self.center_model_list
+
+    @staticmethod
+    def _find_tensor_with_spatial_dims(x):
+        if isinstance(x, torch.Tensor) and x.ndim >= 3:
+            return x
+        if isinstance(x, (list, tuple)):
+            for item in x:
+                t = CenterDirProcesser._find_tensor_with_spatial_dims(item)
+                if t is not None:
+                    return t
+        if isinstance(x, dict):
+            for item in x.values():
+                t = CenterDirProcesser._find_tensor_with_spatial_dims(item)
+                if t is not None:
+                    return t
+        return None
+
+    @staticmethod
+    def _resize_like_map(x, target_hw, mode='bilinear'):
+        if not isinstance(x, torch.Tensor):
+            return x
+
+        if x.ndim == 4:
+            if tuple(x.shape[-2:]) == tuple(target_hw):
+                return x
+            if mode == 'nearest':
+                return F.interpolate(x, size=target_hw, mode=mode)
+            return F.interpolate(x, size=target_hw, mode=mode, align_corners=False)
+
+        if x.ndim == 3:
+            if tuple(x.shape[-2:]) == tuple(target_hw):
+                return x
+            x4 = x.unsqueeze(1)
+            if mode == 'nearest':
+                y = F.interpolate(x4, size=target_hw, mode=mode)
+            else:
+                y = F.interpolate(x4, size=target_hw, mode=mode, align_corners=False)
+            return y[:, 0]
+
+        return x
+
+    @staticmethod
+    def _resize_recursive(x, target_hw, mode='bilinear'):
+        if isinstance(x, torch.Tensor):
+            return CenterDirProcesser._resize_like_map(x, target_hw, mode=mode)
+        if isinstance(x, list):
+            return [CenterDirProcesser._resize_recursive(v, target_hw, mode=mode) for v in x]
+        if isinstance(x, tuple):
+            return tuple(CenterDirProcesser._resize_recursive(v, target_hw, mode=mode) for v in x)
+        if isinstance(x, dict):
+            return {k: CenterDirProcesser._resize_recursive(v, target_hw, mode=mode) for k, v in x.items()}
+        return x
+
+    @staticmethod
+    def _scale_center_predictions(center_pred, scale_x, scale_y):
+        if not isinstance(center_pred, torch.Tensor) or center_pred.ndim != 3 or center_pred.shape[-1] < 3:
+            return center_pred
+
+        center_pred = center_pred.clone()
+        valid = center_pred[:, :, 0] != 0
+
+        center_pred[:, :, 1][valid] *= scale_x
+        center_pred[:, :, 2][valid] *= scale_y
+        return center_pred
+
+    @staticmethod
+    def _scale_coordinate_like_attributes(pred_attributes, scale_x, scale_y):
+        if not isinstance(pred_attributes, dict):
+            return pred_attributes
+
+        scaled = {}
+        for key, val in pred_attributes.items():
+            if not isinstance(val, torch.Tensor):
+                scaled[key] = val
+                continue
+
+            key_lower = key.lower()
+            is_coordinate_attr = any(token in key_lower for token in ['center', 'coord', 'point', 'xy', 'bbox', 'polygon'])
+            if not is_coordinate_attr or val.ndim < 3 or val.shape[-1] < 2:
+                scaled[key] = val
+                continue
+
+            val_scaled = val.clone()
+            val_scaled[..., 0] *= scale_x
+            val_scaled[..., 1] *= scale_y
+            scaled[key] = val_scaled
+
+        return scaled
+
+    def _rescale_center_output_to_input(self, center_output, model_output, input_image):
+        model_tensor = self._find_tensor_with_spatial_dims(model_output)
+        if model_tensor is None or not isinstance(input_image, torch.Tensor) or input_image.ndim < 4:
+            return center_output
+
+        src_h, src_w = model_tensor.shape[-2:]
+        dst_h, dst_w = input_image.shape[-2:]
+
+        if (src_h, src_w) == (dst_h, dst_w):
+            return center_output
+
+        scale_x = float(dst_w) / float(src_w)
+        scale_y = float(dst_h) / float(src_h)
+
+        center_output_scaled = dict(center_output)
+        if 'output' in center_output_scaled:
+            center_output_scaled['output'] = self._resize_recursive(center_output_scaled['output'], (dst_h, dst_w), mode='bilinear')
+        if 'center_heatmap' in center_output_scaled:
+            center_output_scaled['center_heatmap'] = self._resize_recursive(center_output_scaled['center_heatmap'], (dst_h, dst_w), mode='bilinear')
+        if 'pred_mask' in center_output_scaled:
+            center_output_scaled['pred_mask'] = self._resize_recursive(center_output_scaled['pred_mask'], (dst_h, dst_w), mode='nearest')
+        if 'center_pred' in center_output_scaled:
+            center_output_scaled['center_pred'] = self._scale_center_predictions(center_output_scaled['center_pred'], scale_x, scale_y)
+        if 'pred_attributes' in center_output_scaled:
+            center_output_scaled['pred_attributes'] = self._scale_coordinate_like_attributes(center_output_scaled['pred_attributes'], scale_x, scale_y)
+
+        return center_output_scaled
 
     def clean_memory(self):
         self.model.cpu()
@@ -57,8 +174,11 @@ class CenterDirProcesser:
         for sample_ in tqdm(dataset_it, **tqdm_kwargs):
 
             # call centerdir_groundtruth_op first which will create any missing centerdir_groundtruth (using GPU) and add synthetic output
+            # and also update model function if requested to use cached outputs (or requested to save them)
             if centerdir_groundtruth_op is not None:
                 sample_ = centerdir_groundtruth_op(sample_, torch.arange(0, dataset_it.batch_size).int())
+                model = centerdir_groundtruth_op.module.insert_cached_model(self.model, sample_)
+            else:
                 model = self.model
 
             im_batch = sample_['image']
@@ -71,12 +191,14 @@ class CenterDirProcesser:
 
                 # run center detection model
                 center_output = center_model(output_batch_, **sample_)
+                center_output = self._rescale_center_output_to_input(center_output, output_batch_, im_batch)
 
-                output_batch, center_pred, center_heatmap = [center_output[k] for k in ['output',
-                                                                                        'center_pred',
-                                                                                        'center_heatmap']]
-                # optional output
-                pred_angle = center_output.get('pred_angle')
+                output_batch, center_pred, center_heatmap, pred_mask = [center_output[k] for k in ['output',
+                                                                                                   'center_pred',
+                                                                                                   'center_heatmap',
+                                                                                                   'pred_mask']]
+                # optional output (predicted attributes)
+                pred_attributes = center_output.get('pred_attributes')
 
                 # extract centers either from 'centerdir_groundtruth' or from 'center' in sample
                 gt_centers = None
@@ -105,7 +227,10 @@ class CenterDirProcesser:
                     im_image += 1
                     output = output_batch[batch_i:batch_i + 1]
 
-                    sample = {k: sample_[k][batch_i:batch_i + 1] for k in sample_keys}
+                    def extract_batch(s,i):
+                        return {k: (extract_batch(v,i) if type(v) == dict else v[i:i + 1]) for k,v in s.items() }
+
+                    sample = extract_batch(sample_, batch_i)
 
                     im = sample['image']
                     im_name = sample['im_name'][0]
@@ -114,8 +239,9 @@ class CenterDirProcesser:
                     instance = sample['instance'].squeeze()
                     ignore = sample.get('ignore')
 
-                    if 'centerdir_groundtruth' in sample_:
-                        sample['centerdir_groundtruth'] = sample_['centerdir_groundtruth'][0][batch_i]
+                    if 'centerdir_groundtruth' in sample:
+                        # remove batch dim from centerdir_groundtruth matrixes to make it backward compatible with original version of centerdir_groundtruth
+                        sample['centerdir_groundtruth'] = {k:v[0] for k,v in sample['centerdir_groundtruth'].items()}
 
                     if len(gt_centers_dict) > 0:
                         center_dict = gt_centers_dict[batch_i]
@@ -129,6 +255,13 @@ class CenterDirProcesser:
                     else:
                         center_dict = None
 
+                    # if multiple output then the second one is classification
+                    has_cls = type(output) in [tuple, list]
+                    if has_cls:
+                        output, output_cls, resnet_features, CAM = output
+                    else:
+                        output_cls, resnet_features, CAM = None, None, None
+
                     # extract prediction heatmap and sorted prediction list
                     pred_heatmap = torch.relu(center_heatmap[batch_i].unsqueeze(0))
                     predictions = center_pred[batch_i][center_pred[batch_i,:,0] == 1][:,1:].cpu().numpy()
@@ -137,16 +270,37 @@ class CenterDirProcesser:
                     idx = idx[::-1]
                     predictions = predictions[idx, :]
 
-                    # sort predicted angle if present
-                    pred_angle_b = pred_angle[batch_i].cpu().numpy()[idx, :] if pred_angle is not None else None
+                    if pred_mask is not None:
+                        pred_mask_b = pred_mask[batch_i]
 
-                    assert len(pred_angle_b) == len(predictions)
+                        # re-label prediction mask to ensure prediction id order matches id in mask
+                        new_pred_mask_b = torch.zeros_like(pred_mask_b)
 
+                        for new_id, old_id in enumerate(idx):
+                            new_pred_mask_b[pred_mask_b == old_id+1] = new_id+1
+                        pred_mask_b = new_pred_mask_b
+                    else:
+                        pred_mask_b = None
+
+                    pred_attrib_b = {}
+                    if pred_attributes is not None:
+                        # sort and add any predicted attributes associated with each center
+                        for k, attr_vals in pred_attributes.items():
+                            assert attr_vals is not None, f"ERROR: predicted attribute '{k}' should not be None"
+
+                            attr_batch = attr_vals[batch_i].cpu().numpy()[idx, :]
+
+                            assert len(attr_batch) == len(predictions)
+
+                            pred_attrib_b[k] = attr_batch
                     # simply return all input and output data
                     output_dict = dict(output=output,
+                                       output_cls=output_cls,
+                                       resnet_features=resnet_features, CAM=CAM,
                                        predictions=predictions,
+                                       pred_mask=pred_mask_b,
                                        pred_heatmap=pred_heatmap,
-                                       pred_angle=pred_angle_b,
+                                       pred_attributes=pred_attrib_b,
                                        center_model_name=center_model_name)
 
                     # update sample data with center_dict and override im_name and instance
@@ -155,4 +309,3 @@ class CenterDirProcesser:
                                        center_dict=center_dict,))
 
                     yield sample, output_dict
-

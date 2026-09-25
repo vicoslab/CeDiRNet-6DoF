@@ -1,0 +1,28 @@
+.git
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+exp/
+# Docker copies only the model registry and released Python configurations.
+# Keep checkpoints, upload bundles, and all other model files out of context.
+models/**
+!models/model_definitions.json
+!models/configs/
+models/configs/**
+!models/configs/cedirnet6dof_crop_rgb.py
+!models/configs/cedirnet6dof_crop_rgbd.py
+!models/configs/cedirnet6dof_nocrop_rgb.py
+dataset/
+data/
+dist/
+release_artifacts/
+**/*.pth
+**/*.pt
+**/*.ckpt
+**/*.onnx
+**/*.safetensors
+**/*.zip
+**/*.tar
+**/*.tar.*
+**/*.tgz
