@@ -4,11 +4,13 @@
 
 Domen Tabernik · Peter Nimac · Jan Jerićević · Danijel Skočaj · Andrej Gams
 
-**[Paper](https://ieeexplore.ieee.org/document/11700396) · [Supplementary video](https://data.vicos.si/skokec/rtfm/CeDiRNet-6DoF/cedirnet_demo_h264_1080p_submission.mp4) · [Pretrained models](#models) · [Dataset](#dataset-setup) · [Citation](#citation)**
+**[arXiv](https://arxiv.org/abs/2609.31452) · [IEEE paper](https://ieeexplore.ieee.org/document/11700396) · [Supplementary video](https://data.vicos.si/skokec/rtfm/CeDiRNet-6DoF/cedirnet_demo_h264_1080p_submission.mp4) · [Pretrained models](#models) · [Dataset](#dataset-setup) · [Citation](#citation)**
 
 CeDiRNet-6DoF predicts where and how to grasp hanging cloth so that a second robot arm can stretch it open. From a single RGB observation, the network localizes grasp candidates and estimates the gripper's full 3D orientation; measured depth and camera calibration complete each 6-DoF pose. This repository provides the paper's learning and inference code, pretrained RGB/RGB-D models, and dataset sidecar masks.
 
-The method achieved **second place at the ICRA 2024 Cloth Competition**. In the paper's subsequent robot evaluation on the competition item set, it achieved **61.3% cloth coverage and 72.5% grasp success**; the full results and protocol distinctions are [below](#reported-robot-results).[1]
+🏆 🥈 The method achieved **second place at the [ICRA 2024 Cloth Competition](https://airo.ugent.be/cloth_competition/)**, a robotic cloth-manipulation challenge. In the paper's subsequent robot evaluation on the competition item set, it achieved **61.3% cloth coverage and 72.5% grasp success**; the full results and protocol distinctions are [below](#reported-robot-results).[1]
+
+The paper is available on [arXiv (2609.31452)](https://arxiv.org/abs/2609.31452). The original journal publication is available through [IEEE Xplore](https://ieeexplore.ieee.org/document/11700396) ([DOI: 10.1109/TCYB.2026.3732543](https://doi.org/10.1109/TCYB.2026.3732543)).
 
 ## Supplementary video
 
